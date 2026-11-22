@@ -6,7 +6,7 @@
 
 Use an "extra controller" from [Intiface Central](https://intiface.com/central) and
 [buttplug.io](https://buttplug.io) to feel every like, retweet and reply your X/Twitter
-account gets, deep in your body. vibetwt ("vibe twitter") is an interactive terminal
+account gets, deep in your body. vibetwt is an interactive terminal
 dashboard, and a sibling of [VibeClaude](https://github.com/transkatgirl/vibeclaude), whose
 way of mixing it borrows.
 
