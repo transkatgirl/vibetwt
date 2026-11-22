@@ -1,0 +1,22 @@
+{
+  "name": "vibetwt",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Plays distinct Buttplug vibration patterns when your X/Twitter account gets likes, retweets, and replies.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "start": "node src/cli.js run",
+    "login": "node src/cli.js login",
+    "try": "node src/cli.js try",
+    "cleanup": "node src/cli.js cleanup",
+    "test": "node --test --test-concurrency=1 test/*.test.js"
+  },
+  "dependencies": {
+    "buttplug": "5.0.2",
+    "ws": "8.23.0"
+  }
+}
