@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createServer as createHttpServer } from 'node:http';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -217,6 +218,62 @@ test('a refused request reports the answer given to the token it was meant for',
     await assert.rejects(api.json('GET', '/2/activity/subscriptions'), /HTTP 403: This token was not accepted\./);
   } finally {
     await x.close();
+  }
+});
+
+test('a 429 says how long to wait only when X does, or when its limit has run out', async () => {
+  let headers = {};
+  const server = createHttpServer((req, res) => {
+    res.writeHead(429, { 'content-type': 'application/json', ...headers });
+    res.end(JSON.stringify({ title: 'Too Many Requests' }));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const api = new XApi({ xApiBase: `http://127.0.0.1:${server.address().port}`, bearerToken: 'app-token' }, {});
+  const inTenMinutes = () => String(Math.floor(Date.now() / 1000) + 600);
+  const asked = async (sent) => {
+    headers = sent;
+    const refusal = await api.openStream({}, new AbortController().signal).catch((error) => error);
+    assert.equal(refusal.status, 429);
+    return refusal.retryAfterMs;
+  };
+  const aboutTenMinutes = (ms) => ms > 590_000 && ms <= 600_000;
+
+  try {
+    assert.equal(await asked({}), null, 'nothing said is nothing asked');
+    assert.equal(await asked({ 'retry-after': '30' }), 30_000);
+    assert.ok(
+      aboutTenMinutes(await asked({ 'x-rate-limit-remaining': '0', 'x-rate-limit-reset': inTenMinutes() })),
+      'a limit that has run out is back when it resets',
+    );
+    assert.ok(
+      aboutTenMinutes(await asked({ 'x-rate-limit-reset': inTenMinutes() })),
+      'and one that does not say what is left of it is taken to have run out',
+    );
+    assert.equal(
+      await asked({ 'retry-after': '30', 'x-rate-limit-remaining': '49', 'x-rate-limit-reset': inTenMinutes() }),
+      30_000,
+      'what X asks for outright counts whatever is left',
+    );
+    assert.equal(
+      await asked({ 'x-rate-limit-remaining': '49', 'x-rate-limit-reset': inTenMinutes() }),
+      null,
+      'with requests left, the limit is not what refused this one, and its reset says nothing',
+    );
+
+    // So a stream turned away with requests to spare is asked for again in a
+    // minute, and not when the window ends.
+    const stop = new AbortController();
+    const logs = [];
+    const log = (line) => {
+      logs.push(line);
+      stop.abort();
+    };
+    await new ActivityStream({ api, onEvent() {}, log }).run(stop.signal);
+    assert.match(logs[0], /HTTP 429: Too Many Requests \(trying again in 60s\)$/);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
   }
 });
 

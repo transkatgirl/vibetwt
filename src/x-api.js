@@ -6,9 +6,15 @@ export class XApiError extends Error {
   }
 }
 
+// How long X asks to be left alone, or null where it does not say. The reset
+// is when a limit that has run out is whole again, so it is only an answer if
+// the limit has run out. With requests still left, something else refused
+// this one, and the reset may be most of a window away for no reason. A reply
+// that does not say what is left is taken at its word, as one that has none.
 function retryAfter(headers) {
   const seconds = Number(headers.get('retry-after'));
   if (seconds > 0) return seconds * 1000;
+  if (Number(headers.get('x-rate-limit-remaining')) > 0) return null;
   const reset = Number(headers.get('x-rate-limit-reset'));
   return reset > 0 ? Math.max(0, reset * 1000 - Date.now()) : null;
 }
