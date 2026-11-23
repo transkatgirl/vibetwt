@@ -233,9 +233,7 @@ ordinary environment variables.
 | `BUTTPLUG_URL` | `ws://127.0.0.1:12345` | Intiface Central's server address. |
 
 If X answers with HTTP 401 or 403, run `npm run login` again and check that `X_BEARER_TOKEN`
-belongs to the same app as `X_CLIENT_ID`. The same goes for a login that has run out. When
-the stream or the subscriptions meet either, vibetwt stops, since trying again would get the
-same answer.
+belongs to the same app as `X_CLIENT_ID`.
 
 Your tokens, the strength, the list of subscriptions vibetwt has open and a `lock` naming
 the copy that is running are kept in `~/.config/vibetwt`, with owner-only permissions.
