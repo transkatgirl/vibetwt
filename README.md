@@ -95,7 +95,7 @@ but never played later.
 | `u` | Filter to the selected event's user |
 | `x` | Hide the selected event's user |
 | `c` | Clear the filter |
-| `f` | Fetch missing tweet text or username (paid, price shown first) |
+| `f` | Fetch a username or tweet text that is missing or cut short (paid, price shown first) |
 
 `npm start -- --plain` prints a simple log instead of the dashboard, and so does running
 vibetwt where there is no terminal to draw on. Only `space` and `q` work there.
@@ -156,7 +156,7 @@ and who does not. Press `/` and combine any of these:
 |---|---|
 | `type:like,reply` | Any of those interaction types |
 | `tweet:<ID or URL>` | That tweet, including replies anywhere in its thread |
-| `from:@name` | That user |
+| `from:@name` or `from:<ID>` | That user |
 | `word` or `"exact phrase"` | Text in the tweet, reply, or username |
 
 Commas in `tweet:` and `from:` also mean "any of", as in `from:@alice,@bob`.
@@ -208,7 +208,7 @@ The dashboard's total is an estimate from these prices, so check the Developer C
 your actual bill. It includes events hidden by your filter, because filtering happens after
 X delivers and bills them. Ignoring someone does not make them any cheaper.
 
-X events do not always include the original tweet's text or the author's username. vibetwt
+X events do not always include the original tweet's full text or the author's username. vibetwt
 shows what it receives, and only makes a paid lookup when you press `f` or apply a filter
 with a username it does not know.
 
@@ -233,24 +233,29 @@ ordinary environment variables.
 | `BUTTPLUG_URL` | `ws://127.0.0.1:12345` | Intiface Central's server address. |
 
 If X answers with HTTP 401 or 403, run `npm run login` again and check that `X_BEARER_TOKEN`
-belongs to the same app as `X_CLIENT_ID`.
+belongs to the same app as `X_CLIENT_ID`. The same goes for a login that has run out. When
+the stream or the subscriptions meet either, vibetwt stops, since trying again would get the
+same answer.
 
-Your tokens, the strength and the list of subscriptions vibetwt has open are kept in
-`~/.config/vibetwt`, with owner-only permissions. `STATE_DIR` moves them. `NO_BROWSER=1`
-keeps `npm run login` from opening a browser, and `NO_COLOR=1` takes the color out of the
-dashboard.
+Your tokens, the strength, the list of subscriptions vibetwt has open and a `lock` naming
+the copy that is running are kept in `~/.config/vibetwt`, with owner-only permissions.
+`STATE_DIR` moves them. `NO_BROWSER=1` keeps `npm run login` from opening a browser, and
+`NO_COLOR=1` takes the color out of the dashboard.
 
 ## How it works
 
 `src/x-subscriptions.js` asks X's Activity API for three subscriptions on your account:
 likes (`like.create`), retweets (`post.repost.create`) and replies (`post.reply.create`).
 They exist only while vibetwt runs: created on start, renewed an hour before their 24-hour
-expiry, and deleted on exit. Each carries the tag `vibetwt`, and those are the only ones
-vibetwt ever deletes, whatever else your X app has open.
+expiry, and deleted on exit. A renewal that X refuses ends the run, rather than leave it
+listening to subscriptions that are about to lapse. Each carries the tag `vibetwt`, and
+those are the only ones vibetwt ever deletes, whatever else your X app has open.
 
 `src/x-stream.js` holds one long connection to the activity stream and splits it into
-events. When the connection drops, or has said nothing for four minutes, it reconnects,
-waiting longer after each failure, up to about a minute.
+events. When the connection drops, has said nothing for four minutes, or takes more than
+half a minute to open, it reconnects, waiting longer after each failure, up to about a
+minute. If X answers that it is being asked too often, it waits as long as X asks, up to
+fifteen minutes.
 
 `src/session.js` takes each event from there. It drops it if it has been seen before, counts
 it toward the cost, and has `src/events.js` turn it into a like, a retweet or a reply from
@@ -263,7 +268,8 @@ client: it reconnects when the connection is lost, scans until a device that can
 appears, and turns each level into the nearest step the device has.
 
 `src/ui/` draws the dashboard. It redraws only the lines that changed, and takes a paste as
-one key, so a pasted URL cannot press `q` for you.
+one key, so a pasted URL cannot press `q` for you. A paste that stops halfway is dropped
+after two seconds, so that it cannot hold on to the keyboard.
 
 ## Try it without hardware
 

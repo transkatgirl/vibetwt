@@ -11,6 +11,10 @@ const USERNAMES_PER_REQUEST = 100;
 
 const atNames = (names) => names.map((name) => `@${name}`).join(', ');
 
+// Whether X still has more of this event's post to give: all of its text, or
+// the rest of what a retweet only carried the start of.
+const lacksTweetText = (event) => Boolean(event.tweetId && (!event.tweetText || event.tweetTextPartial));
+
 function remember(map, key, value) {
   map.delete(key);
   map.set(key, value);
@@ -224,13 +228,13 @@ export class Session {
   // a post read for the text, and a user read for the name.
   lookupEstimate(event) {
     if (!event) return 0;
-    return (event.tweetId && !event.tweetText ? POST_READ_MICROS : 0)
+    return (lacksTweetText(event) ? POST_READ_MICROS : 0)
       + (event.actorHandle ? 0 : USER_READ_MICROS);
   }
 
   async lookup(event) {
     if (!event || this.#lookups.has(event.key)) return;
-    const needsTweet = Boolean(event.tweetId && !event.tweetText);
+    const needsTweet = lacksTweetText(event);
     const needsActor = !event.actorHandle;
     if (!needsTweet && !needsActor) {
       this.notify('Nothing to fetch for this event.');
@@ -245,7 +249,7 @@ export class Session {
       // Reading it through a reply or retweet would be billed as a post too.
       if (needsActor) await this.#fetchUsers([event.actorId]);
 
-      if (needsTweet && !event.tweetText) {
+      if (needsTweet && lacksTweetText(event)) {
         this.notify('X did not return that tweet. It may be deleted or private.');
       } else if (needsActor && !event.actorHandle) {
         this.notify('X did not return that user. The account may be suspended or deleted.');
@@ -289,7 +293,12 @@ export class Session {
   }
 
   #hydrate(event) {
-    event.tweetText ??= this.#tweets.get(event.tweetId) ?? null;
+    // The whole post replaces nothing, and it replaces the start of itself.
+    const whole = this.#tweets.get(event.tweetId);
+    if (whole && lacksTweetText(event)) {
+      event.tweetText = whole;
+      event.tweetTextPartial = false;
+    }
     event.actorHandle ??= this.#users.get(event.actorId) ?? this.#filterUsers.get(event.actorId) ?? null;
     event.actor = actorLabel(event.actorHandle, event.actorId);
   }

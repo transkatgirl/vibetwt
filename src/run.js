@@ -1,4 +1,5 @@
 import { CostMeter, formatUsd } from './cost.js';
+import { takeLock } from './lock.js';
 import { Mixer } from './mixer.js';
 import { PatternPlayer } from './player.js';
 import { Session } from './session.js';
@@ -13,7 +14,8 @@ import { SubscriptionManager } from './x-subscriptions.js';
 export const log = (message) => console.log(`${new Date().toLocaleTimeString()}  ${message}`);
 
 // One Ctrl+C can arrive twice: the terminal sends it to npm and to its script,
-// and npm passes its copy on. A key can also repeat. Neither is a second request.
+// and npm passes its copy on. That is not a second request, so nothing that
+// comes this soon after the first is taken for one.
 const SAME_REQUEST_MS = 1000;
 
 function watchPlainKeyboard({ onToggle, onQuit, onInterrupt }) {
@@ -56,6 +58,9 @@ export async function runService(config, { noDevice = false, plain = false } = {
   const interactive = !plain && process.stdin.isTTY && process.stdout.isTTY;
   const auth = new XAuth(config);
   const account = await auth.requireSession();
+  // Before anything else is touched: starting removes whatever subscriptions
+  // it finds, and those of a copy that is still running are not leftovers.
+  const unlock = await takeLock(config.stateDir);
   const api = new XApi(config, auth);
   const settings = await loadSettings(config.stateDir);
   const intensityPct = startingIntensity(settings.intensityPct);
@@ -102,7 +107,13 @@ export async function runService(config, { noDevice = false, plain = false } = {
     },
   });
 
-  const subscriptions = new SubscriptionManager(api, account.user_id, { stateDir: config.stateDir, log: say });
+  const subscriptions = new SubscriptionManager(api, account.user_id, {
+    stateDir: config.stateDir,
+    log: say,
+    // The subscriptions run out within the hour, and with them everything
+    // there is to listen to. Stopping says so. Going on would not.
+    onRefused: (error) => fail(`Could not renew the X subscriptions. ${error.message}`),
+  });
   const shutdown = new AbortController();
   let quitAt = 0;
   let unsubscribed = false;
@@ -131,17 +142,18 @@ export async function runService(config, { noDevice = false, plain = false } = {
     }
     process.exit(1);
   };
-  // A crash while shutting down is reported, but the shutdown still finishes.
-  // The dashboard takes its notices with it when it closes, so a reason it was
-  // showing is kept, to print once the terminal is back.
-  const crashes = [];
-  const onCrash = (error) => {
+  // Ends the run over something that went wrong. One that comes while shutting
+  // down is reported, but the shutdown still finishes. The dashboard takes its
+  // notices with it when it closes, so a reason it was showing is kept, to
+  // print once the terminal is back.
+  const failures = [];
+  const fail = (reason) => {
     process.exitCode = 1;
-    const reason = `Unexpected error: ${error?.message ?? error}`;
-    if (tui?.active) crashes.push(reason);
+    if (tui?.active) failures.push(reason);
     if (shutdown.signal.aborted) say(reason);
     else quit(reason);
   };
+  const onCrash = (error) => fail(`Unexpected error: ${error?.message ?? error}`);
   // A closed terminal sends SIGHUP. Nobody is waiting, so it never cuts cleanup short.
   const handlers = {
     SIGINT: interrupt,
@@ -170,7 +182,7 @@ export async function runService(config, { noDevice = false, plain = false } = {
   const restoreTerminal = () => {
     tui?.stop();
     stopPlainKeyboard();
-    for (const reason of crashes.splice(0)) log(reason);
+    for (const reason of failures.splice(0)) log(reason);
   };
 
   const stream = new ActivityStream({
@@ -202,6 +214,7 @@ export async function runService(config, { noDevice = false, plain = false } = {
     if (failed > 0) log(`${failed} X subscription(s) could not be removed. Run \`npm run cleanup\`.`);
     else log('Removed X subscriptions.');
     log(`Estimated API cost this session: ${formatUsd(session.cost.snapshot().totalMicros)}`);
+    unlock();
     Object.entries(handlers).forEach(([name, handler]) => process.off(name, handler));
   }
 }

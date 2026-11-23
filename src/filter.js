@@ -82,6 +82,15 @@ function tokenize(query) {
 
 const textLeaf = (value) => ({ field: 'text', values: [value.toLowerCase()] });
 
+// A user is kept the way it is written: `@name`, or an account ID as a bare
+// number. Only the @ tells them apart, because a name can be all digits too.
+// Anything else without one is a name with its @ left off.
+function userValue(part) {
+  if (/^\d+$/.test(part)) return part;
+  const name = part.replace(/^@/, '').toLowerCase();
+  return name && `@${name}`;
+}
+
 function parseWord(raw) {
   const token = raw.replaceAll('"', '').trim();
   if (raw.startsWith('"')) return textLeaf(token);
@@ -94,9 +103,10 @@ function parseWord(raw) {
   if (field === 'type' || field === 'kind') {
     if (parts.length === 0) throw new Error('type: needs like, retweet, or reply.');
     const kinds = parts.map((name) => {
-      const kind = KIND_NAMES[name.toLowerCase()];
-      if (!kind) throw new Error(`Unknown type "${name}". Use like, retweet, or reply.`);
-      return kind;
+      // Its own names only: every object also answers to names like "constructor".
+      const key = name.toLowerCase();
+      if (!Object.hasOwn(KIND_NAMES, key)) throw new Error(`Unknown type "${name}". Use like, retweet, or reply.`);
+      return KIND_NAMES[key];
     });
     return { field: 'type', values: KINDS.filter((kind) => kinds.includes(kind)) };
   }
@@ -106,14 +116,14 @@ function parseWord(raw) {
     return { field: 'tweet', values: [...new Set(ids)] };
   }
   if (field === 'from' || field === 'user') {
-    const users = parts.map((part) => part.replace(/^@/, '').toLowerCase()).filter(Boolean);
+    const users = parts.map(userValue).filter(Boolean);
     if (users.length === 0) throw new Error('from: needs a username.');
     return { field: 'from', values: [...new Set(users)] };
   }
 
   if (POST_HOST.test(token) && tweetIdFrom(token)) return { field: 'tweet', values: [tweetIdFrom(token)] };
   if (/^\d{15,}$/.test(token)) return { field: 'tweet', values: [token] };
-  if (/^@\w+$/.test(token)) return { field: 'from', values: [token.slice(1).toLowerCase()] };
+  if (/^@\w+$/.test(token)) return { field: 'from', values: [token.toLowerCase()] };
   return textLeaf(token);
 }
 
@@ -222,6 +232,10 @@ function formatTerm(term) {
   return needsQuotes ? `"${term}"` : term;
 }
 
+// A user is quoted if it holds something that would end the word early when
+// read back.
+const formatUser = (user) => (/[\s()]/.test(user) ? `"${user}"` : user);
+
 function formatNode(node, parentOp) {
   if (node.op === 'not') {
     const inner = formatNode(node.item, 'not');
@@ -230,7 +244,7 @@ function formatNode(node, parentOp) {
   switch (node.field) {
     case 'type': return `type:${node.values.join(',')}`;
     case 'tweet': return `tweet:${node.values.join(',')}`;
-    case 'from': return `from:${node.values.map((user) => (/^\d+$/.test(user) ? user : `@${user}`)).join(',')}`;
+    case 'from': return `from:${node.values.map(formatUser).join(',')}`;
     case 'text': return formatTerm(node.values[0]);
     default:
   }
@@ -258,7 +272,9 @@ function matchesNode(node, event) {
     case 'tweet':
       return node.values.some((id) => id === event.tweetId || id === event.postId || id === event.conversationId);
     case 'from':
-      return node.values.some((user) => user === event.actorId || user === event.actorHandle?.toLowerCase());
+      return node.values.some((user) => (
+        user.startsWith('@') ? user.slice(1) === event.actorHandle?.toLowerCase() : user === event.actorId
+      ));
     default:
       return [event.text, event.tweetText, event.actorHandle]
         .filter(Boolean)
@@ -288,6 +304,7 @@ function narrowed(filter, field, value) {
 }
 
 export const withTweet = (filter, id) => narrowed(filter, 'tweet', id);
+// `user` is `@name` or an account ID, here and below.
 export const withUser = (filter, user) => narrowed(filter, 'from', user);
 
 // Adds a user to the filter's top-level exclusion, creating it if needed.
@@ -302,7 +319,8 @@ export function withoutUser(filter, user) {
   return { ...filter, expr: group('and', items.map((item) => (item === existing ? merged : item))) };
 }
 
-// Every username the filter mentions. Numeric values are account IDs already.
+// Every username the filter mentions, without its @. An account ID is not
+// one, and needs no looking up.
 export function filterUsernames(filter) {
   const users = new Set();
   const visit = (node) => {
@@ -310,7 +328,7 @@ export function filterUsernames(filter) {
     if (node.op === 'not') visit(node.item);
     else if (node.op) node.items.forEach((item) => visit(item));
     else if (node.field === 'from') {
-      node.values.filter((value) => !/^\d+$/.test(value)).forEach((value) => users.add(value));
+      node.values.filter((value) => value.startsWith('@')).forEach((value) => users.add(value.slice(1)));
     }
   };
   visit(filter.expr);

@@ -100,6 +100,56 @@ test('a paste arrives as one key, even split across chunks', () => {
   assert.deepEqual(parser.push('1~'), [{ name: 'paste', text: 'https://x.com/q/status/1' }]);
 });
 
+test('a paste whose end never comes is dropped, and Ctrl+C gets through meanwhile', () => {
+  const parser = new KeyParser();
+  assert.deepEqual(parser.push('\x1b[200~half a paste'), []);
+  assert.ok(parser.pasting);
+  assert.deepEqual(parser.push(' q'), [], 'until it is given up on, keys are taken for more of it');
+  assert.deepEqual(parser.push('\x03'), [{ name: 'ctrl-c' }], 'but a read that is only Ctrl+C was pressed');
+  assert.deepEqual(parser.push('\x03\x03'), [{ name: 'ctrl-c' }, { name: 'ctrl-c' }]);
+  assert.deepEqual(parser.push('a\x03'), [], 'one among other text is more of the paste');
+  assert.deepEqual(parser.flush(), [], 'what there was of it is not a paste');
+  assert.ok(!parser.pasting && !parser.pending);
+  assert.deepEqual(parser.push(' q'), [{ name: 'char', text: ' ' }, { name: 'char', text: 'q' }]);
+
+  // The start of an end marker that was being held back goes with the rest.
+  assert.deepEqual(parser.push('\x1b[200~text\x1b[20'), []);
+  assert.deepEqual(parser.flush(), []);
+  assert.deepEqual(parser.push('1~x'), [{ name: 'char', text: '1' }, { name: 'char', text: '~' }, { name: 'char', text: 'x' }]);
+});
+
+test('the dashboard gives up on an unfinished paste after a pause, so space can stop the device again', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const app = harness();
+  app.tui.start();
+  seed(app.session);
+
+  app.send('\x1b[200~https://x.com/q/status/1');
+  app.send(' ');
+  assert.equal(app.session.paused, false, 'still inside the paste');
+  t.mock.timers.tick(1600);
+  app.send('q');
+  t.mock.timers.tick(1999);
+  assert.equal(app.quits(), 0, 'each piece that arrives keeps it open a little longer');
+  t.mock.timers.tick(1);
+
+  app.send(' ');
+  assert.equal(app.session.paused, true);
+  assert.equal(app.tui.view().edit, null, 'and the half that arrived was not taken for a paste');
+
+  // A paste in pieces that keep coming is still one paste, however long it takes.
+  app.send(' ');
+  app.send('\x1b[200~https://x.com/q/');
+  t.mock.timers.tick(1999);
+  app.send('status/100');
+  t.mock.timers.tick(1999);
+  app.send('\x1b[201~');
+  assert.equal(app.tui.view().edit.text, 'https://x.com/q/status/100');
+  assert.equal(app.quits(), 0);
+  app.tui.stop();
+  app.player.setPaused(true);
+});
+
 test('every line fits the terminal at many sizes, with hostile content', () => {
   for (const cols of [20, 43, 44, 50, 63, 64, 75, 76, 80, 120, 200]) {
     for (const rows of [5, 11, 12, 17, 18, 23, 24, 40]) {
@@ -142,6 +192,21 @@ test('shows the post that was liked and the contents of a reply', () => {
   screen = app.screen().join('\n');
   assert.match(screen, /♥ Like from @alice/);
   assert.match(screen, /x\.com\/i\/status\/100/);
+  app.tui.stop();
+  app.player.setPaused(true);
+});
+
+test('a post too long for the details ends in one ellipsis, even when its last line is full', () => {
+  const cols = 60;
+  const app = harness({ cols, rows: 24 });
+  app.tui.start();
+  app.session.receive({
+    ...likeEvent('long', { liked_tweet_id: '100' }),
+    includes: { tweets: [{ id: '100', text: Array.from({ length: 12 }, () => 'w'.repeat(cols - 2)).join(' ') }] },
+  });
+  const cut = app.screen().map((line) => line.trimEnd()).filter((line) => /^ w+…+$/.test(line));
+  assert.equal(cut.length, 1, 'only the last line that fits is marked');
+  assert.equal(cut[0], ` ${'w'.repeat(cols - 4)}…`);
   app.tui.stop();
   app.player.setPaused(true);
 });
@@ -629,6 +694,60 @@ test('fetch is manual, shows its price, adds to cost, and fills in details', asy
   assert.equal(event.actor, '@bob');
   assert.equal(app.session.cost.snapshot().lookups.micros, 15_000);
   assert.doesNotMatch(app.screen().join('\n'), /fetch missing info/);
+  app.tui.stop();
+  app.player.setPaused(true);
+});
+
+test('a retweet that X cut short can be fetched whole, and is made whole by any event that carries its post', async () => {
+  const whole = `${'word '.repeat(40)}pineapple`;
+  // As X sends it: 140 characters, the last of them an ellipsis.
+  const cut = `RT @tester: ${whole.slice(0, 127)}…`;
+  const users = { users: [{ id: '3', username: 'bob' }] };
+  const calls = [];
+  let gone = false;
+  const api = {
+    async lookupPosts(ids) {
+      calls.push(ids);
+      return gone ? [] : [{ id: ids[0], text: whole }];
+    },
+  };
+  const app = harness({ api });
+  app.tui.start();
+  const retweet = (id, original) => app.session.receive({
+    ...repostEvent(id, { author_id: '3', text: cut, referenced_tweets: [{ type: 'retweeted', id: original }] }),
+    includes: users,
+  });
+
+  retweet('200', '101');
+  const first = app.session.events[0];
+  assert.ok(first.tweetText.endsWith('…') && !first.tweetText.includes('pineapple'));
+  assert.match(app.screen().join('\n'), /f fetch missing info ~\$0\.005/, 'the rest of it is offered, at the price of a post');
+  app.send('f');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(calls, [['101']]);
+  assert.equal(first.tweetText, whole);
+  assert.equal(app.session.notice, 'Fetched.');
+  assert.doesNotMatch(app.screen().join('\n'), /fetch missing info/);
+
+  // Another post, whose text then arrives with a like of it.
+  retweet('201', '102');
+  const second = app.session.events[0];
+  assert.ok(!second.tweetText.includes('pineapple'));
+  app.session.receive({ ...likeEvent('l2', { liked_tweet_id: '102' }), includes: { tweets: [{ id: '102', text: whole }] } });
+  assert.equal(second.tweetText, whole);
+  assert.equal(app.session.lookupEstimate(second), 0);
+  applyFilter(app, 'pineapple');
+  assert.deepEqual(app.session.visible().map((event) => event.kind), ['like', 'retweet', 'retweet'], 'and its words can be searched for');
+  assert.equal(calls.length, 1, 'none of which was paid for');
+
+  // A third, which X cannot give the rest of.
+  gone = true;
+  applyFilter(app, '');
+  retweet('202', '103');
+  app.send('f');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.match(app.session.notice, /X did not return that tweet/);
+  assert.ok(app.session.events[0].tweetText.endsWith('…'), 'the start of it stays');
   app.tui.stop();
   app.player.setPaused(true);
 });

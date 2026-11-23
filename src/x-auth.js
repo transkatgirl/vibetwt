@@ -7,6 +7,14 @@ import { openInBrowser } from './browser.js';
 const SCOPES = 'tweet.read users.read like.read offline.access';
 const LOGIN_TIMEOUT_MS = 5 * 60_000;
 
+// The saved login has run out and cannot be renewed. Nothing that needs it
+// will work until `npm run login` is run again, however often X is asked.
+export class LoginExpired extends Error {
+  constructor() {
+    super('X session expired. Run `npm run login` again.');
+  }
+}
+
 export async function writePrivateJson(path, dir, value) {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const temp = `${path}.${process.pid}.tmp`;
@@ -66,10 +74,19 @@ export class XAuth {
 
   async requireSession() {
     if (!this.#session) {
+      let saved;
       try {
-        this.#session = JSON.parse(await readFile(this.#file, 'utf8'));
+        saved = await readFile(this.#file, 'utf8');
       } catch (error) {
         if (error.code !== 'ENOENT') throw error;
+      }
+      if (saved !== undefined) {
+        try {
+          this.#session = JSON.parse(saved);
+        } catch {
+          // Logging in writes the file afresh, whatever is in it now.
+          throw new Error(`The saved login in ${this.#file} cannot be read. Run \`npm run login\` again.`);
+        }
       }
     }
     if (!this.#session) throw new Error('Not logged in. Run `npm run login` first.');
@@ -126,14 +143,12 @@ export class XAuth {
   }
 
   async #refresh(session) {
-    if (!session.refresh_token) throw new Error('X session expired. Run `npm run login` again.');
+    if (!session.refresh_token) throw new LoginExpired();
     let tokens;
     try {
       tokens = await this.#tokenRequest({ grant_type: 'refresh_token', refresh_token: session.refresh_token });
     } catch (error) {
-      if (error.status === 400 || error.status === 401) {
-        throw new Error('X session expired. Run `npm run login` again.');
-      }
+      if (error.status === 400 || error.status === 401) throw new LoginExpired();
       throw error;
     }
     await this.#save({ ...session, ...this.#fromTokens(tokens, session.refresh_token) });

@@ -9,12 +9,19 @@ import WebSocket from 'ws';
 
 class CommandTimeout extends Error {}
 
-function withTimeout(promise, ms) {
+// Gives up on `promise` after `ms`, or at once if `signal` aborts first.
+function withTimeout(promise, ms, signal) {
   let timer;
-  const timeout = new Promise((_, reject) => {
+  let onAbort;
+  const gaveUp = new Promise((_, reject) => {
     timer = setTimeout(() => reject(new CommandTimeout(`No response within ${ms}ms`)), ms);
+    onAbort = () => reject(signal.reason);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  return Promise.race([promise, gaveUp]).finally(() => {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+  });
 }
 
 // The library removes its socket error listener after connecting, and an
@@ -181,7 +188,8 @@ export class Vibrator {
       this.#watchDevices(client);
 
       try {
-        await withTimeout(client.connect(connector), this.#connectTimeoutMs);
+        // Closing cuts an attempt short, since its answer may never come.
+        await withTimeout(client.connect(connector), this.#connectTimeoutMs, this.#abort.signal);
         // close() had nothing to disconnect if it was called while this connected.
         if (this.#closed) {
           await connector.disconnect().catch(() => {});
@@ -203,7 +211,7 @@ export class Vibrator {
       } catch (error) {
         await connector.disconnect().catch(() => {});
         connector.abandon();
-        if (error.message !== lastError) {
+        if (!this.#closed && error.message !== lastError) {
           lastError = error.message;
           this.#log(`Waiting for Intiface at ${this.#url} (${error.message}). Is its server started?`);
         }

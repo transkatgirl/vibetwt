@@ -33,7 +33,17 @@ export class KeyParser {
     return this.#buffer.length > 0 && this.#paste === null;
   }
 
+  // Inside a paste whose end has not arrived yet.
+  get pasting() {
+    return this.#paste !== null;
+  }
+
   push(chunk) {
+    // A terminal sends a paste in large pieces, so a read that is nothing but
+    // Ctrl+C was pressed, not pasted. It gets through even when a paste's end
+    // never comes, which would otherwise swallow it with every other key.
+    if (this.#paste !== null && /^\x03+$/.test(chunk)) return Array.from(chunk, () => ({ name: 'ctrl-c' }));
+
     // An Escape still waiting when more arrives was the key itself, unless
     // what arrives carries on its sequence.
     const escape = this.pending && this.#buffer === '\x1b' && chunk && !/^[[O]/.test(chunk);
@@ -42,7 +52,14 @@ export class KeyParser {
   }
 
   // A lone Escape looks like the start of a sequence until no more arrives.
+  // A paste still open by then is not going to end. It is dropped, along with
+  // whatever was typed into it, so that the keys after it are keys again.
   flush() {
+    if (this.#paste !== null) {
+      this.#paste = null;
+      this.#buffer = '';
+      return [];
+    }
     return this.#drain(true);
   }
 

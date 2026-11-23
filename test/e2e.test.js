@@ -2,15 +2,17 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { existsSync, readFileSync } from 'node:fs';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 import { postText } from '../src/events.js';
 import { Vibrator } from '../src/vibrator.js';
 import { XApi } from '../src/x-api.js';
+import { ActivityStream } from '../src/x-stream.js';
 import { likeEvent, ME, replyEvent, repostEvent, startFakeButtplug, startFakeX, waitFor } from './helpers.js';
 
 const CLI = resolve('src/cli.js');
@@ -33,21 +35,31 @@ const FAKE_TERMINAL = `data:text/javascript,${encodeURIComponent(`
   process.on('SIGUSR2', () => { throw new Error('thrown on request'); });
 `)}`;
 
+// `command` is what to run, if not the app itself. `files` are written to its
+// state directory first, by name, over what is put there anyway, and a name
+// may put one in a directory of its own. `beside` is an app already started,
+// whose state directory this one is to share as it stands.
 async function startApp(x, buttplug, tokenOverrides = {}, {
-  env = {}, ready = true, args = [], nodeArgs = [], stdin = 'ignore',
+  env = {}, ready = true, args = [], nodeArgs = [], stdin = 'ignore', command = 'run', files = {}, beside = null,
 } = {}) {
-  const stateDir = await mkdtemp(join(tmpdir(), 'vibetwt-test-'));
-  await writeFile(join(stateDir, 'tokens.json'), JSON.stringify({
-    access_token: 'user-token',
-    refresh_token: 'refresh',
-    expires_at: Date.now() + 3_600_000,
-    user_id: ME,
-    username: 'tester',
-    ...tokenOverrides,
-  }));
-  await writeFile(join(stateDir, 'settings.json'), JSON.stringify({ intensityPct: STRENGTH_PCT }));
+  const stateDir = beside?.stateDir ?? await mkdtemp(join(tmpdir(), 'vibetwt-test-'));
+  if (!beside) {
+    await writeFile(join(stateDir, 'tokens.json'), JSON.stringify({
+      access_token: 'user-token',
+      refresh_token: 'refresh',
+      expires_at: Date.now() + 3_600_000,
+      user_id: ME,
+      username: 'tester',
+      ...tokenOverrides,
+    }));
+    await writeFile(join(stateDir, 'settings.json'), JSON.stringify({ intensityPct: STRENGTH_PCT }));
+    for (const [name, contents] of Object.entries(files)) {
+      await mkdir(dirname(join(stateDir, name)), { recursive: true });
+      await writeFile(join(stateDir, name), contents);
+    }
+  }
 
-  const child = spawn(process.execPath, [...nodeArgs, CLI, 'run', ...args], {
+  const child = spawn(process.execPath, [...nodeArgs, CLI, command, ...args], {
     cwd: stateDir,
     stdio: [stdin, 'pipe', 'pipe'],
     env: {
@@ -364,6 +376,195 @@ test('will not start without a bearer token, and subscribes to nothing first', a
   }
 });
 
+test('a saved login that cannot be read says so, and how to put it right', async () => {
+  const x = await startFakeX();
+  const buttplug = await startFakeButtplug();
+  const app = await startApp(x, buttplug, {}, { files: { 'tokens.json': '{"access_token": "user-to' }, ready: false });
+
+  try {
+    const code = app.child.exitCode ?? (await once(app.child, 'exit'))[0];
+    assert.equal(code, 1);
+    await waitFor(() => app.output.includes('npm run login'), { label: `what to do about it:\n${app.output}` });
+    assert.ok(app.output.includes(`The saved login in ${join(app.stateDir, 'tokens.json')} cannot be read.`), app.output);
+    assert.equal(x.subscriptions.size, 0);
+    assert.equal(buttplug.clientCount(), 0);
+  } finally {
+    await stopApp(app);
+    await buttplug.close();
+    await x.close();
+  }
+});
+
+// Each start takes every subscription that carries the tag for its own
+// leftovers, and removes it. So does `npm run cleanup`.
+test('a second copy is refused while one is running, and its subscriptions are left alone', async () => {
+  const x = await startFakeX();
+  const buttplug = await startFakeButtplug();
+  const app = await startApp(x, buttplug);
+
+  try {
+    const subscribed = [...x.subscriptions.keys()];
+    for (const command of ['run', 'cleanup']) {
+      const second = await startApp(x, buttplug, {}, { beside: app, command, ready: false });
+      const code = second.child.exitCode ?? (await once(second.child, 'exit'))[0];
+      assert.equal(code, 1, `${command}:\n${second.output}`);
+      await waitFor(() => second.output.includes('Quit it first'), { label: `refusing ${command}:\n${second.output}` });
+      assert.ok(second.output.includes(`vibetwt is already running (process ${app.child.pid})`), second.output);
+      assert.ok(second.output.includes(join(app.stateDir, 'lock')), 'and names the file, in case it is wrong');
+      assert.deepEqual([...x.subscriptions.keys()], subscribed, command);
+    }
+    assert.equal(buttplug.clientCount(), 1, 'nor did either reach for the device');
+
+    // Its events still arrive, which they would not had the subscriptions gone.
+    const start = buttplug.timeline.length;
+    x.push(likeEvent('still-here'));
+    await waitFor(() => buttplug.timeline.length >= start + 4, { label: 'pattern after the refusals' });
+
+    const exit = once(app.child, 'exit');
+    app.child.kill('SIGTERM');
+    assert.equal((await exit)[0], 0, app.output);
+    assert.ok(!existsSync(join(app.stateDir, 'lock')), 'quitting gives the directory back');
+
+    const cleanup = await startApp(x, buttplug, {}, { beside: app, command: 'cleanup', ready: false });
+    assert.equal(cleanup.child.exitCode ?? (await once(cleanup.child, 'exit'))[0], 0, cleanup.output);
+  } finally {
+    await stopApp(app);
+    await buttplug.close();
+    await x.close();
+  }
+});
+
+// After a crash or a power cut the lock is still there, naming a process that is not.
+test('a lock left by a copy that is gone keeps nobody out', async () => {
+  const gone = spawn(process.execPath, ['-e', '']);
+  await once(gone, 'exit');
+  const x = await startFakeX();
+  const buttplug = await startFakeButtplug();
+
+  try {
+    // Nor does one holding what no copy put there, or a file where the lock goes.
+    for (const left of [{ [`lock/${gone.pid}-0a1b2c3d`]: '' }, { 'lock/not a process': '' }, { lock: '' }]) {
+      const app = await startApp(x, buttplug, {}, { files: left });
+      try {
+        assert.equal(x.subscriptions.size, 3);
+        const held = readdirSync(join(app.stateDir, 'lock'));
+        assert.equal(held.length, 1, `only its own is left: ${held}`);
+        assert.ok(held[0].startsWith(`${app.child.pid}-`), `and it is named for it: ${held}`);
+        assert.deepEqual(readdirSync(app.stateDir).filter((name) => name.endsWith('.tmp')), [], 'with nothing left over from taking it');
+      } finally {
+        await stopApp(app);
+      }
+    }
+  } finally {
+    await buttplug.close();
+    await x.close();
+  }
+});
+
+// After a restart the process that left a lock is gone, but its ID may be some
+// other program's by now. This test's own process stands in for that program:
+// it is running, and it did not start when the lock says its process did.
+test('a lock whose process ID has since gone to something else keeps nobody out', {
+  skip: !['darwin', 'linux'].includes(process.platform) && 'nothing here says when a process started',
+}, async () => {
+  const x = await startFakeX();
+  const buttplug = await startFakeButtplug();
+  const app = await startApp(x, buttplug, {}, { files: { [`lock/${process.pid}-0a1b2c3d`]: 'Thu Jan  1 00:00:00 1970' } });
+
+  try {
+    assert.equal(x.subscriptions.size, 3);
+    const held = readdirSync(join(app.stateDir, 'lock'));
+    assert.equal(held.length, 1, `only its own is left: ${held}`);
+    assert.ok(held[0].startsWith(`${app.child.pid}-`), `and it is named for it: ${held}`);
+    assert.notEqual(readFileSync(join(app.stateDir, 'lock', held[0]), 'utf8'), '', 'which says when it started in turn');
+  } finally {
+    await stopApp(app);
+    await buttplug.close();
+    await x.close();
+  }
+});
+
+// Guessing that it is abandoned would cost a copy that is running its subscriptions.
+test('a lock that does not say when its process started is taken at its word', async () => {
+  const x = await startFakeX();
+  const buttplug = await startFakeButtplug();
+  const app = await startApp(x, buttplug, {}, { files: { [`lock/${process.pid}-0a1b2c3d`]: '' }, ready: false });
+
+  try {
+    const code = app.child.exitCode ?? (await once(app.child, 'exit'))[0];
+    assert.equal(code, 1, app.output);
+    await waitFor(() => app.output.includes('Quit it first'), { label: `refusing:\n${app.output}` });
+    assert.ok(app.output.includes(`vibetwt is already running (process ${process.pid})`), app.output);
+    assert.equal(x.subscriptions.size, 0);
+    assert.deepEqual(readdirSync(join(app.stateDir, 'lock')), [`${process.pid}-0a1b2c3d`], 'and is left as it was');
+  } finally {
+    await stopApp(app);
+    await buttplug.close();
+    await x.close();
+  }
+});
+
+// Each finds the same lock to clear away, and what one clears must not be the
+// lock that another has just taken.
+test('of several copies started at once over a lock left behind, one gets it', async () => {
+  const gone = spawn(process.execPath, ['-e', '']);
+  await once(gone, 'exit');
+  const dir = await mkdtemp(join(tmpdir(), 'vibetwt-test-'));
+  await mkdir(join(dir, 'lock'));
+  await writeFile(join(dir, 'lock', `${gone.pid}-0a1b2c3d`), '');
+  // Says how it went, then holds on until told, so that none of them starts
+  // after the lock has been given back.
+  const script = `
+    import { takeLock } from ${JSON.stringify(pathToFileURL(resolve('src/lock.js')).href)};
+    console.log(await takeLock(process.argv[1]).then(() => 'held', () => 'refused'));
+    process.stdin.resume();
+  `;
+
+  const copies = Array.from({ length: 8 }, () => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script, dir], { stdio: ['pipe', 'pipe', 'inherit'] });
+    const copy = { child, said: '' };
+    child.stdout.on('data', (data) => { copy.said += data; });
+    return copy;
+  });
+  try {
+    await waitFor(() => copies.every((copy) => copy.said.includes('\n')), { label: 'every copy to say how it went' });
+    const said = copies.map((copy) => copy.said.trim());
+    assert.equal(said.filter((answer) => answer === 'held').length, 1, said.join(' '));
+    assert.equal(said.filter((answer) => answer === 'refused').length, copies.length - 1, said.join(' '));
+
+    const exits = copies.map((copy) => once(copy.child, 'exit'));
+    for (const copy of copies) copy.child.stdin.end();
+    await Promise.all(exits);
+    assert.deepEqual(readdirSync(dir), [], 'and the one that got it gives it back, with nothing left over');
+  } finally {
+    for (const copy of copies) copy.child.kill();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('only a pattern there is can be tried', async () => {
+  const x = await startFakeX();
+  const buttplug = await startFakeButtplug();
+
+  try {
+    // Every object answers to these names, and they are not patterns.
+    for (const name of ['constructor', 'toString']) {
+      const app = await startApp(x, buttplug, {}, { command: 'try', args: ['like', name, '--no-device'], ready: false });
+      try {
+        const code = app.child.exitCode ?? (await once(app.child, 'exit'))[0];
+        assert.equal(code, 1, app.output);
+        await waitFor(() => app.output.includes(`Unknown pattern "${name}"`), { label: `refusing ${name}:\n${app.output}` });
+        assert.doesNotMatch(app.output, /soft double tap/, 'and nothing is played before it is refused');
+      } finally {
+        await stopApp(app);
+      }
+    }
+  } finally {
+    await buttplug.close();
+    await x.close();
+  }
+});
+
 test('a mistyped option is refused, so a wrong --no-device cannot run with the device on', async () => {
   const x = await startFakeX();
   const buttplug = await startFakeButtplug();
@@ -380,6 +581,70 @@ test('a mistyped option is refused, so a wrong --no-device cannot run with the d
       } finally {
         await stopApp(app);
       }
+    }
+  } finally {
+    await buttplug.close();
+    await x.close();
+  }
+});
+
+// `npm start --no-device`, without the `--`, never reaches the app as an option.
+test('an option that npm kept for itself is refused too', async () => {
+  const x = await startFakeX();
+  const buttplug = await startFakeButtplug();
+
+  try {
+    for (const [flag, setting] of [['--no-device', { npm_config_device: '' }], ['--plain', { npm_config_plain: 'true' }]]) {
+      const app = await startApp(x, buttplug, {}, { env: { ...setting, npm_lifecycle_event: 'start' }, ready: false });
+      try {
+        await waitFor(() => app.child.exitCode !== null, { label: `refusing ${flag}:\n${app.output}` });
+        assert.equal(app.child.exitCode, 1);
+        assert.ok(app.output.includes(`npm kept "${flag}" for itself. Put "--" before it: npm start -- ${flag}`), app.output);
+        assert.equal(x.subscriptions.size, 0);
+        assert.equal(buttplug.clientCount(), 0);
+      } finally {
+        await stopApp(app);
+      }
+    }
+  } finally {
+    await buttplug.close();
+    await x.close();
+  }
+});
+
+// npm passes on every setting it has, wherever it got it.
+test('a setting that an .npmrc gave npm is not taken for an option it kept', async () => {
+  const x = await startFakeX();
+  const buttplug = await startFakeButtplug();
+  const settings = { npm_config_device: '', npm_config_plain: 'true', npm_lifecycle_event: 'start' };
+
+  try {
+    // In turn, the project's file, the user's, and the one for everybody.
+    for (const [name, where] of [['.npmrc', 'npm_config_local_prefix'], ['npmrc', 'npm_config_userconfig'], ['npmrc', 'npm_config_globalconfig']]) {
+      const dir = await mkdtemp(join(tmpdir(), 'vibetwt-test-'));
+      await writeFile(join(dir, name), '; not vibetwt\'s\r\nplain\r\n"device" = false\r\n');
+      const env = { ...settings, [where]: name === '.npmrc' ? dir : join(dir, name) };
+      // Starting at all shows it was let through, and the device that neither was read as an option.
+      const app = await startApp(x, buttplug, {}, { env });
+      try {
+        assert.doesNotMatch(app.output, /npm kept/, where);
+        assert.equal(buttplug.clientCount(), 1, where);
+      } finally {
+        await stopApp(app);
+        await rm(dir, { recursive: true, force: true });
+      }
+    }
+
+    // A file that has other settings, or only speaks of these, explains nothing.
+    const dir = await mkdtemp(join(tmpdir(), 'vibetwt-test-'));
+    await writeFile(join(dir, 'npmrc'), '# device=false\nplaintext=true\nmy-device = 1\n');
+    const app = await startApp(x, buttplug, {}, { env: { ...settings, npm_config_userconfig: join(dir, 'npmrc') }, ready: false });
+    try {
+      await waitFor(() => app.child.exitCode !== null, { label: `refusing:\n${app.output}` });
+      assert.match(app.output, /npm kept "--no-device" for itself/);
+    } finally {
+      await stopApp(app);
+      await rm(dir, { recursive: true, force: true });
     }
   } finally {
     await buttplug.close();
@@ -450,10 +715,96 @@ test('a second Ctrl+C later on quits at once, and says what it leaves behind', a
     assert.ok(x.subscriptions.size > 0);
     const saved = JSON.parse(await readFile(join(app.stateDir, 'subscriptions.json'), 'utf8'));
     assert.deepEqual(saved.sort(), [...x.subscriptions.keys()].sort(), 'the next start knows what to remove');
+    assert.ok(!existsSync(join(app.stateDir, 'lock')), 'and is not kept out');
   } finally {
     await stopApp(app);
     await buttplug.close();
     await x.close();
+  }
+});
+
+// Those inside the first second are passed over, and do not put off the one
+// that comes after it.
+test('a Ctrl+C pressed again and again is asking again', async () => {
+  const x = await startFakeX({ slowDeletesMs: 1500 });
+  const buttplug = await startFakeButtplug();
+  const app = await startApp(x, buttplug);
+
+  try {
+    const exit = once(app.child, 'exit');
+    for (let pressedMs = 0; pressedMs < 3000 && app.child.exitCode === null; pressedMs += 300) {
+      app.child.kill('SIGINT');
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    const [code] = await exit;
+    assert.equal(code, 1, app.output);
+    assert.match(app.output, /Quit before the X subscriptions were removed.*npm run cleanup/);
+    assert.ok(x.subscriptions.size > 0);
+  } finally {
+    await stopApp(app);
+    await buttplug.close();
+    await x.close();
+  }
+});
+
+// X takes the connection and says nothing, not even no.
+test('an X that never answers is given up on, and asked again', async () => {
+  const sockets = new Set();
+  const silent = createServer((socket) => sockets.add(socket.on('error', () => {}).resume()));
+  silent.listen(0, '127.0.0.1');
+  await once(silent, 'listening');
+  const api = new XApi(
+    { xApiBase: `http://127.0.0.1:${silent.address().port}`, bearerToken: 'app-token' },
+    { accessToken: async () => 'user-token' },
+  );
+  const stop = new AbortController();
+  const logs = [];
+  const statuses = [];
+  const stream = new ActivityStream({
+    api,
+    onEvent() {},
+    openTimeoutMs: 100,
+    onStatus: (status) => statuses.push(status),
+    log: (line) => {
+      logs.push(line);
+      if (logs.length === 2) stop.abort();
+    },
+  });
+
+  try {
+    await stream.run(stop.signal);
+    assert.deepEqual(logs, ['X stream problem: No answer from X.', 'X stream problem: No answer from X.']);
+    assert.deepEqual(statuses, ['reconnecting', 'reconnecting'], 'and it is never called live');
+    assert.equal(sockets.size, 2);
+    await waitFor(() => [...sockets].every((socket) => socket.destroyed), { label: 'both attempts dropped' });
+  } finally {
+    stop.abort();
+    for (const socket of sockets) socket.destroy();
+    silent.close();
+  }
+});
+
+test('closing does not wait for an Intiface that never answers', async () => {
+  // Takes the connection and then says nothing, so the attempt would run to its timeout.
+  const sockets = new Set();
+  const silent = createServer((socket) => sockets.add(socket.on('error', () => {}).resume()));
+  silent.listen(0, '127.0.0.1');
+  await once(silent, 'listening');
+  const logs = [];
+  const vibrator = new Vibrator({ url: `ws://127.0.0.1:${silent.address().port}`, log: (line) => logs.push(line) });
+
+  try {
+    vibrator.start();
+    await waitFor(() => sockets.size === 1, { label: 'connection attempt' });
+    const closingAt = Date.now();
+    await vibrator.close();
+    assert.ok(Date.now() - closingAt < 1000, 'well inside the five seconds an attempt is given');
+    await waitFor(() => [...sockets].every((socket) => socket.destroyed), { label: 'attempt abandoned' });
+    assert.deepEqual(logs, [], 'and leaving is not reported as Intiface being away');
+  } finally {
+    await vibrator.close();
+    for (const socket of sockets) socket.destroy();
+    silent.close();
   }
 });
 

@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { XApiError } from './x-api.js';
-import { writePrivateJson } from './x-auth.js';
+import { LoginExpired, writePrivateJson } from './x-auth.js';
 
 export const TAG = 'vibetwt';
 const PATH = '/2/activity/subscriptions';
@@ -9,6 +9,10 @@ const TTL_MS = 24 * 60 * 60_000;
 const RENEW_BEFORE_MS = 60 * 60_000;
 const RETRY_MS = 5 * 60_000;
 const CHECK_MS = 60_000;
+
+// What asking again will not put right: the login has run out, or X turns it down.
+const isRefusal = (error) => error instanceof LoginExpired
+  || (error instanceof XApiError && (error.status === 401 || error.status === 403));
 
 export const subscriptionSpecs = (userId) => [
   { event_type: 'like.create', filter: { user_id: userId, direction: 'inbound' } },
@@ -24,17 +28,21 @@ export class SubscriptionManager {
   #dir;
   #file;
   #log;
+  #onRefused;
   #active = new Map();
   #timer = null;
   #renewing = null;
   #stopped = false;
 
-  constructor(api, userId, { stateDir, log = () => {} }) {
+  // `onRefused` is told when a renewal fails in a way that trying again will
+  // not mend. Nothing more is tried after that.
+  constructor(api, userId, { stateDir, log = () => {}, onRefused }) {
     this.#api = api;
     this.#userId = userId;
     this.#dir = stateDir;
     this.#file = join(stateDir, 'subscriptions.json');
     this.#log = log;
+    this.#onRefused = onRefused ?? ((error) => log(`Subscription renewal was refused: ${error.message}`));
   }
 
   async start() {
@@ -155,17 +163,28 @@ export class SubscriptionManager {
       this.#schedule(TTL_MS - RENEW_BEFORE_MS);
     } catch (error) {
       if (this.#stopped) return;
+      // Trying this again every five minutes would only run the subscriptions
+      // down to their expiry, with nothing to show that they had gone.
+      if (isRefusal(error)) {
+        this.#onRefused(error);
+        return;
+      }
       this.#log(`Subscription renewal failed, retrying in 5 minutes: ${error.message}`);
       this.#schedule(RETRY_MS);
     }
   }
 
+  // The IDs an earlier run wrote down. A file that cannot be read is no reason
+  // to leave anything subscribed: what is open now and what X lists under the
+  // tag are still known, and the cleanup ends by writing the file afresh.
   async #savedIds() {
     try {
-      return JSON.parse(await readFile(this.#file, 'utf8'));
+      const saved = JSON.parse(await readFile(this.#file, 'utf8'));
+      if (!Array.isArray(saved)) throw new Error('it does not hold a list');
+      return saved.filter((id) => typeof id === 'string' || typeof id === 'number');
     } catch (error) {
-      if (error.code === 'ENOENT') return [];
-      throw error;
+      if (error.code !== 'ENOENT') this.#log(`Could not read the saved subscriptions: ${error.message}`);
+      return [];
     }
   }
 

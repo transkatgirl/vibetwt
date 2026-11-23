@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -14,6 +14,8 @@ import { PATTERNS } from '../src/patterns.js';
 import { MAX_VOICES, PatternPlayer } from '../src/player.js';
 import { displayWidth, sanitizeText, singleLine, truncate, wordEndAfter, wordStartBefore, wrap } from '../src/text.js';
 import { toDeviceValue } from '../src/vibrator.js';
+import { XApiError } from '../src/x-api.js';
+import { LoginExpired } from '../src/x-auth.js';
 import { ActivityStream, JsonFrameSplitter } from '../src/x-stream.js';
 import { SubscriptionManager, TAG } from '../src/x-subscriptions.js';
 import { likeEvent, ME, OTHER, replyEvent, repostEvent } from './helpers.js';
@@ -125,6 +127,35 @@ function subscriptionApi({ refreshes }) {
   };
 }
 
+// The file is a note of what was open. What is open now, and what X lists
+// under the tag, say the same without it.
+test('a saved list that cannot be read does not stop the cleanup', async (t) => {
+  for (const contents of ['["1","2",', '{"1":true}']) {
+    const stateDir = await mkdtemp(join(tmpdir(), 'vibetwt-test-'));
+    t.after(() => rm(stateDir, { recursive: true, force: true }));
+    const file = join(stateDir, 'subscriptions.json');
+    const api = subscriptionApi({ refreshes: true });
+    const logs = [];
+    const manager = new SubscriptionManager(api, ME, { stateDir, log: (line) => logs.push(line) });
+    await manager.start();
+    assert.equal(api.live.size, 3);
+
+    await writeFile(file, contents);
+    assert.deepEqual(await manager.stop(), { deleted: 3, failed: 0 }, contents);
+    assert.equal(api.live.size, 0, contents);
+    assert.equal(logs.length, 1, logs.join('\n'));
+    assert.match(logs[0], /^Could not read the saved subscriptions: /);
+    assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), [], 'and the file is put right');
+
+    // Nor does it keep the next start out, which begins with a cleanup.
+    await writeFile(file, contents);
+    const next = new SubscriptionManager(api, ME, { stateDir });
+    await next.start();
+    assert.equal(api.live.size, 3, contents);
+    assert.deepEqual(await next.stop(), { deleted: 3, failed: 0 }, contents);
+  }
+});
+
 test('renewal leaves one live subscription of each type, however X answers a repeat', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
 
@@ -196,6 +227,61 @@ test('stopping in the middle of a renewal still leaves nothing subscribed', asyn
   }
 });
 
+test('a renewal X will go on refusing is reported once and not tried again, unlike one that may yet work', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const turns = async () => {
+    for (let turn = 0; turn < 200; turn++) await new Promise((resolve) => setImmediate(resolve));
+  };
+  // A day in steps, so that a retry due five minutes after a failure is reached.
+  const aDayPasses = async () => {
+    for (let step = 0; step < 24 * 12; step++) {
+      t.mock.timers.tick(5 * 60_000);
+      await turns();
+    }
+  };
+
+  const failures = [
+    ['a login that has run out', new LoginExpired(), true],
+    ['a 401', new XApiError(401, 'Unauthorized'), true],
+    ['a 403', new XApiError(403, 'Forbidden'), true],
+    ['a 503', new XApiError(503, 'Service Unavailable'), false],
+    ['a dropped connection', new TypeError('fetch failed'), false],
+  ];
+  for (const [label, failure, refused] of failures) {
+    const stateDir = await mkdtemp(join(tmpdir(), 'vibetwt-test-'));
+    t.after(() => rm(stateDir, { recursive: true, force: true }));
+    const api = subscriptionApi({ refreshes: true });
+    const logs = [];
+    const told = [];
+    const manager = new SubscriptionManager(api, ME, {
+      stateDir, log: (line) => logs.push(line), onRefused: (error) => told.push(error),
+    });
+    await manager.start();
+
+    const answer = api.json;
+    let posts = 0;
+    api.json = async (method, ...rest) => {
+      if (method !== 'POST') return answer(method, ...rest);
+      posts++;
+      throw failure;
+    };
+    await aDayPasses();
+
+    if (refused) {
+      assert.deepEqual(told, [failure], label);
+      assert.equal(posts, 1, `${label}: asked once`);
+      assert.deepEqual(logs, [], label);
+    } else {
+      assert.deepEqual(told, [], label);
+      assert.ok(posts > 10, `${label}: asked again and again, ${posts} times`);
+      assert.match(logs[0], /^Subscription renewal failed, retrying in 5 minutes: /, label);
+    }
+
+    api.json = answer;
+    assert.deepEqual(await manager.stop(), { deleted: 3, failed: 0 }, `${label}: stopping still removes them`);
+  }
+});
+
 // On Linux a timer does not count the time a machine spends asleep, but the
 // subscriptions go on expiring.
 test('a renewal that came due while the machine slept happens soon after it wakes', async (t) => {
@@ -262,6 +348,51 @@ test('a reconnect that drops early asks again for what it was meant to recover',
   assert.deepEqual(queries, [{}, { backfill_minutes: 3 }, { backfill_minutes: 3 }]);
 });
 
+test('a login that has run out ends the stream, since asking again cannot bring it back', async () => {
+  let asked = 0;
+  const logs = [];
+  const api = {
+    async openStream() {
+      asked++;
+      throw new LoginExpired();
+    },
+  };
+  const stream = new ActivityStream({ api, onEvent() {}, log: (line) => logs.push(line) });
+  await assert.rejects(stream.run(new AbortController().signal), /X session expired\. Run `npm run login` again\./);
+  assert.equal(asked, 1);
+  assert.deepEqual(logs, []);
+});
+
+// `asked` is how long X says to wait, one entry for each time it is asked.
+// Runs until the last of them has been reported.
+async function rateLimitedWaits(asked) {
+  const waits = [];
+  const stop = new AbortController();
+  const api = {
+    async openStream() {
+      throw new XApiError(429, 'Too Many Requests', asked[waits.length]);
+    },
+  };
+  const log = (line) => {
+    waits.push(line.match(/^X stream problem: .*429.* \(trying again in (.+)\)$/)?.[1] ?? line);
+    if (waits.length === asked.length) stop.abort();
+  };
+  await new ActivityStream({ api, onEvent() {}, log }).run(stop.signal);
+  return waits;
+}
+
+test('a rate limit is waited out as X asks, but never at once and never for long', async (t) => {
+  t.mock.method(Math, 'random', () => 0.5);
+  assert.deepEqual(await rateLimitedWaits([0, 0]), ['1s', '2s'], 'a time already past is no reason to hurry');
+  assert.deepEqual(await rateLimitedWaits([30_000]), ['30s'], 'a time ahead is kept to');
+  assert.deepEqual(await rateLimitedWaits([null]), ['60s'], 'no time at all gets a minute');
+  assert.deepEqual(await rateLimitedWaits([24 * 60 * 60_000]), ['15 min'], 'a day off is asked about sooner');
+  assert.deepEqual(await rateLimitedWaits([89_000]), ['89s']);
+  assert.deepEqual(await rateLimitedWaits([90_000]), ['1 min 30s'], 'a minute and a half is not called two');
+  assert.deepEqual(await rateLimitedWaits([149_500]), ['2 min 30s']);
+  assert.deepEqual(await rateLimitedWaits([10 * 60_000]), ['10 min']);
+});
+
 test('classifies likes, retweets, and replies', () => {
   assert.equal(normalizeEvent(likeEvent(), ME).kind, 'like');
   assert.equal(normalizeEvent(repostEvent(), ME).kind, 'retweet');
@@ -302,6 +433,55 @@ test('extracts post text and handles from event payloads', () => {
     const long = normalizeEvent(replyEvent('long', { text: 'The start…', [field]: { text: 'The start and the rest' } }), ME);
     assert.equal(long.text, 'The start and the rest', field);
   }
+});
+
+test('a retweet that carries only the start of its post says so', () => {
+  // X stops a retweet's text at 140 characters, the last of them an ellipsis.
+  const start = 'The start of a long post, '.repeat(6).slice(0, 131);
+  const text = `RT @me: ${start}…`;
+  assert.equal(text.length, 140);
+  const cut = normalizeEvent(repostEvent('r', { text }), ME);
+  assert.equal(cut.tweetText, `${start}…`);
+  assert.equal(cut.tweetTextPartial, true);
+  const linked = `RT @me: ${start.slice(0, 107)}… https://t.co/abcdefghij`;
+  assert.equal(linked.length, 140);
+  assert.equal(normalizeEvent(repostEvent('r', { text: linked }), ME).tweetTextPartial, true, 'a link after the ellipsis is still a cut');
+  // Tidying turns each "&amp;" into "&", which leaves this one twenty characters shorter.
+  const escaped = `${`RT @me: ${'R&amp;D '.repeat(5)}${start}`.slice(0, 139)}…`;
+  assert.equal(escaped.length, 140);
+  const tidied = normalizeEvent(repostEvent('r', { text: escaped }), ME);
+  assert.ok(tidied.tweetText.startsWith('R&D R&D R&D R&D R&D The start'), tidied.tweetText);
+  assert.equal(tidied.tweetTextPartial, true, 'a cut is measured as X sent it, not as it reads once tidied');
+
+  const partial = (post) => normalizeEvent(repostEvent('r', { text: `RT @me: ${post}` }), ME).tweetTextPartial;
+  assert.equal(partial('Hello world'), false, 'a short post is all there');
+  assert.equal(partial('Wait for it…'), false, 'and so is one that ends in an ellipsis of its own');
+  assert.equal(partial(`${start.slice(0, 100)}…`), false, 'however long, short of where X cuts');
+  assert.equal(partial(start), false, 'nor is a long one cut that does not end in one');
+
+  const carried = normalizeEvent({
+    ...repostEvent('r', { text }),
+    includes: { tweets: [{ id: '2080761390344937796', text: 'The start of a long post, and the rest' }] },
+  }, ME);
+  assert.equal(carried.tweetText, 'The start of a long post, and the rest');
+  assert.equal(carried.tweetTextPartial, false, 'nor is anything missing when the post came with it');
+  const unnamed = normalizeEvent(repostEvent('r', { text, referenced_tweets: undefined }), ME);
+  assert.equal(unnamed.tweetTextPartial, false, 'with no post to ask for, what there is has to do');
+  assert.equal(normalizeEvent(likeEvent(), ME).tweetTextPartial, false);
+});
+
+test('an event is timed by when it happened, which for a like is not when its post was written', () => {
+  const happened = '2026-10-07T19:17:36.304Z';
+  const written = '2026-07-22T06:23:07.000Z';
+  const like = (envelope, payload) => normalizeEvent({ ...likeEvent('t', { created_at: written, ...payload }), ...envelope }, ME);
+  assert.equal(like({ created_at: happened }).createdAt, Date.parse(happened), 'the envelope says when');
+  assert.equal(like({}, { timestamp_ms: '1784927565236' }).createdAt, 1784927565236, 'and failing that, the like does');
+  const before = Date.now();
+  assert.ok(like({}).createdAt >= before, 'and failing both it is now, never the time of the post');
+
+  const reply = replyEvent('r', { created_at: written });
+  assert.equal(normalizeEvent(reply, ME).createdAt, Date.parse(written), 'a reply is a post, so its time is its own');
+  assert.equal(normalizeEvent({ ...reply, created_at: happened }, ME).createdAt, Date.parse(happened));
 });
 
 test('malformed includes do not throw', () => {
@@ -476,8 +656,19 @@ test('quitting with overlapping voices sends one stop', async () => {
   player.play('like');
   await mixer.settled();
   await player.close();
-  assert.deepEqual(output.sent.filter((level) => level > 0), [1], 'never steps down through the weaker voice');
-  assert.equal(output.sent.at(-1), 0);
+  assert.deepEqual(output.sent, [1, 0], 'never steps down through the weaker voice, and stops once');
+});
+
+test('a device that has caught up is stopped with one command, on pause and on quit', async () => {
+  for (const stop of [(mixer) => mixer.setMuted(true), (mixer) => mixer.close()]) {
+    const output = new RecordingOutput();
+    const mixer = new Mixer(output);
+    mixer.channel().set(0.5);
+    await mixer.settled();
+    await stop(mixer);
+    await mixer.settled();
+    assert.deepEqual(output.sent, [0.5, 0]);
+  }
 });
 
 test('a weaker type does not cut short a stronger one, and fills its gaps', async () => {
@@ -517,6 +708,16 @@ test('pause stops everything and blocks new patterns until resumed', async () =>
   assert.equal(output.sent.at(-1), 0);
 });
 
+test('a name every object answers to is not a pattern', () => {
+  const output = new RecordingOutput();
+  const player = new PatternPlayer(new Mixer(output));
+  for (const name of ['constructor', 'toString', 'likes']) {
+    assert.throws(() => player.play(name), new RegExp(`Unknown pattern: ${name}`));
+  }
+  assert.deepEqual(player.active, []);
+  assert.deepEqual(output.sent, []);
+});
+
 test('filter syntax round-trips and reports mistakes', () => {
   const filter = parseFilter('type:reply,rt tweet:https://x.com/me/status/123?s=20 from:@Alice "two words" hello');
   assert.deepEqual(filter.kinds, ['retweet', 'reply']);
@@ -533,16 +734,25 @@ test('filter syntax round-trips and reports mistakes', () => {
     'from:@a,@b tweet:1,2',
     '"or" "and" "@bob" "x.com/a/status/1" "1234567890123456789" ":)"',
     '(a OR (b (c OR d)))',
+    'from:"a b",@c cats',
+    '(from:"a)b" OR NOT from:"(c",12345) d',
   ]) {
     const parsed = parseFilter(query);
     assert.deepEqual(parseFilter(formatFilter(parsed)), parsed, query);
   }
+  assert.equal(formatFilter(parseFilter('from:"a b",@c')), 'from:"@a b",@c', 'a name that would not read back whole is quoted');
 
   assert.equal(formatFilter(parseFilter('https://twitter.com/i/web/status/456')), 'tweet:456');
   assert.equal(formatFilter(parseFilter('1234567890123456789')), 'tweet:1234567890123456789');
   assert.equal(formatFilter(parseFilter('2024')), '2024');
   assert.equal(formatFilter(parseFilter('@bob')), 'from:@bob');
   assert.throws(() => parseFilter('type:nope'), /Unknown type/);
+  // Every object answers to these names, and they are not types.
+  for (const name of ['constructor', '__proto__', 'Constructor']) {
+    for (const query of [`type:${name}`, `NOT type:${name}`, `type:${name} OR cats`, `type:like,${name}`]) {
+      assert.throws(() => parseFilter(query), new RegExp(`Unknown type "${name}"`), query);
+    }
+  }
   assert.throws(() => parseFilter('tweet:abc'), /tweet ID or URL/);
   assert.equal(formatFilter(EMPTY_FILTER), '');
 });
@@ -623,15 +833,34 @@ test('NOT on types stays accurate on the toggles, and incomplete NOTs explain th
 });
 
 test('hiding users builds one exclusion and keeps the rest of the filter', () => {
-  const hidden = withoutUser(withoutUser(withoutUser(EMPTY_FILTER, 'c'), 'd'), 'c');
+  const hidden = withoutUser(withoutUser(withoutUser(EMPTY_FILTER, '@c'), '@d'), '@c');
   assert.equal(formatFilter(hidden), 'NOT from:@c,@d');
-  assert.equal(formatFilter(withoutUser(parseFilter('from:@a OR from:@b'), 'c')), '(from:@a OR from:@b) NOT from:@c');
+  assert.equal(formatFilter(withoutUser(parseFilter('from:@a OR from:@b'), '@c')), '(from:@a OR from:@b) NOT from:@c');
   assert.equal(formatFilter(withTweet(parseFilter('NOT from:@a'), '5')), 'NOT from:@a tweet:5');
-  assert.equal(formatFilter(withUser(parseFilter('NOT from:@a'), 'b')), 'NOT from:@a from:@b');
+  assert.equal(formatFilter(withUser(parseFilter('NOT from:@a'), '@b')), 'NOT from:@a from:@b');
   assert.deepEqual(
     filterUsernames(parseFilter('NOT from:@a,123 NOT (from:@b OR cats) NOT (x NOT from:@c) from:@d')),
     ['a', 'b', 'c', 'd'],
   );
+});
+
+// X allows a name made only of digits, and an account ID is nothing else.
+test('a user is a name with its @ and an account ID without, even when the name is all digits', () => {
+  const named = parseFilter('from:@123456');
+  assert.equal(formatFilter(named), 'from:@123456', 'the @ is kept, since it is all that says which');
+  assert.deepEqual(filterUsernames(named), ['123456'], 'so it is looked up like any other name');
+  assert.equal(formatFilter(parseFilter('@123456')), 'from:@123456');
+  assert.equal(formatFilter(parseFilter('from:123456')), 'from:123456');
+  assert.deepEqual(filterUsernames(parseFilter('from:123456')), []);
+  assert.equal(formatFilter(parseFilter('from:Alice,@BOB,42')), 'from:@alice,@bob,42', 'a name may leave its @ off');
+
+  const from = (actorId, actorHandle) => ({ kind: 'like', actorId, actorHandle });
+  assert.ok(matchesFilter(named, from('9', '123456')));
+  assert.ok(!matchesFilter(named, from('123456', null)), 'a name is not an account ID');
+  assert.ok(!matchesFilter(named, from('123456', 'somebody')));
+  assert.ok(matchesFilter(parseFilter('from:123456'), from('123456', 'somebody')));
+  assert.ok(!matchesFilter(parseFilter('from:123456'), from('9', '123456')), 'nor an account ID a name');
+  assert.ok(matchesFilter(parseFilter('NOT from:@123456'), from('123456', null)));
 });
 
 test('type OR filters stay accurate on the type toggles', () => {
@@ -658,7 +887,7 @@ test('post and user shortcuts narrow an OR filter without breaking it', () => {
   const filter = parseFilter('from:@a OR from:@b');
   assert.equal(formatFilter(withTweet(filter, '5')), '(from:@a OR from:@b) tweet:5');
   assert.equal(formatFilter(withTweet(withTweet(filter, '5'), '6')), '(from:@a OR from:@b) tweet:6');
-  assert.equal(formatFilter(withUser(parseFilter('type:reply from:@a cats'), 'b')), 'type:reply cats from:@b');
+  assert.equal(formatFilter(withUser(parseFilter('type:reply from:@a cats'), '@b')), 'type:reply cats from:@b');
 });
 
 test('filters match by type, post, thread, user, and text', () => {

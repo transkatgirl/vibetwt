@@ -188,7 +188,8 @@ function detailLines(view, cols, height) {
   const shown = body.slice(0, room);
   if (body.length > room && shown.length > 0) {
     const last = shown[shown.length - 1][0];
-    shown[shown.length - 1] = [s(`${truncate(last.text, width - 1)}…`, ...last.styles)];
+    // Cut as one piece, since a line cut first would already end in an ellipsis.
+    shown[shown.length - 1] = [s(truncate(`${last.text}…`, width), ...last.styles)];
   }
   while (shown.length < room) shown.push([]);
 

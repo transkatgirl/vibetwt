@@ -9,9 +9,14 @@ const ENTER_SCREEN = '\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?2004h\x1b[2J';
 const LEAVE_SCREEN = '\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[0m\x1b[?1049l';
 const FRAME_MS = 33;
 const ESCAPE_WAIT_MS = 40;
+// A paste arrives in a burst. One that has gone this long with nothing more
+// and no end has lost it, and until it is given up on, every key pressed is
+// taken for part of it: space and q included.
+const PASTE_WAIT_MS = 2000;
 const INTENSITY_STEP = 5;
 
-const userOf = (event) => event.actorHandle?.toLowerCase() ?? event.actorId;
+// As a filter writes a user: `@name`, or the account ID where X left the name out.
+const userOf = (event) => (event.actorHandle ? `@${event.actorHandle.toLowerCase()}` : event.actorId);
 
 export class Tui {
   #session;
@@ -26,7 +31,7 @@ export class Tui {
   #edit = null;
   #frame = [];
   #frameTimer = null;
-  #escapeTimer = null;
+  #flushTimer = null;
   #active = false;
   #console = null;
 
@@ -72,7 +77,7 @@ export class Tui {
     if (!this.#active) return;
     this.#session.onChange = () => {};
     clearTimeout(this.#frameTimer);
-    clearTimeout(this.#escapeTimer);
+    clearTimeout(this.#flushTimer);
     this.#stdin.off('data', this.#onData);
     this.#stdout.off('resize', this.#onResize);
     process.off('exit', this.#restore);
@@ -99,12 +104,13 @@ export class Tui {
   };
 
   #onData = (chunk) => {
-    clearTimeout(this.#escapeTimer);
+    clearTimeout(this.#flushTimer);
     for (const key of this.#parser.push(chunk)) this.handleKey(key);
-    if (this.#parser.pending) {
-      this.#escapeTimer = setTimeout(() => {
+    const wait = this.#parser.pasting ? PASTE_WAIT_MS : this.#parser.pending ? ESCAPE_WAIT_MS : 0;
+    if (wait > 0) {
+      this.#flushTimer = setTimeout(() => {
         for (const key of this.#parser.flush()) this.handleKey(key);
-      }, ESCAPE_WAIT_MS);
+      }, wait);
     }
   };
 

@@ -62,7 +62,7 @@ export class PatternPlayer {
   }
 
   play(kind) {
-    if (!PATTERNS[kind]) throw new Error(`Unknown pattern: ${kind}`);
+    if (!Object.hasOwn(PATTERNS, kind)) throw new Error(`Unknown pattern: ${kind}`);
     if (this.#paused || this.#closed) return false;
 
     const voice = new Voice(kind, PATTERNS[kind].steps, this.#mixer.channel(), (ended, channel) => {

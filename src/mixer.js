@@ -56,8 +56,8 @@ export class Mixer {
 
   setMuted(muted) {
     this.#muted = muted;
-    this.#update();
     if (muted) this.#stopPastQueue();
+    this.#update();
   }
 
   // The device may have just reconnected, so its state is unknown. Send it
@@ -77,8 +77,8 @@ export class Mixer {
     clearTimeout(this.#retry);
     this.#levels.clear();
     this.#muted = true;
-    this.#update();
     this.#stopPastQueue();
+    this.#update();
     await this.settled();
   }
 
@@ -94,6 +94,8 @@ export class Mixer {
 
   // A stop should not wait behind a command a slow device has yet to answer.
   // Commands stay in order on the socket, so nothing older can land after it.
+  // This comes before the level is updated, because a device that has caught
+  // up has no queue: the update sends its stop, and one stop is enough.
   #stopPastQueue() {
     if (this.#isDraining) this.#output.stop().catch((error) => this.#report(error));
   }

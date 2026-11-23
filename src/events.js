@@ -3,9 +3,8 @@ import { decodeEntities, sanitizeText, singleLine } from './text.js';
 const list = (value) => (Array.isArray(value) ? value : []);
 // A long post carries its full text apart from `text`. X's API reference calls
 // that field `note_post`, and its data dictionary `note_tweet`.
-export const postText = (post) => (
-  decodeEntities(sanitizeText(post?.note_post?.text ?? post?.note_tweet?.text ?? post?.text)) || null
-);
+const sentText = (post) => post?.note_post?.text ?? post?.note_tweet?.text ?? post?.text;
+export const postText = (post) => decodeEntities(sanitizeText(sentText(post))) || null;
 
 export const actorLabel = (handle, id) => (handle ? `@${handle}` : `user ${id}`);
 
@@ -32,6 +31,35 @@ export function collectKnown(event) {
 
 function refId(payload, type) {
   return list(payload.referenced_tweets).find((ref) => ref?.type === type)?.id ?? null;
+}
+
+// X stops a retweet's own text, "RT @you: " included, at 140 characters, and
+// puts an ellipsis last to say so. Its docs for this API leave that out, but
+// it is what its older ones have always done. A link can follow the ellipsis,
+// which is how X ends other text it has cut.
+const RETWEET_CHARS = 140;
+// Nothing says the cut lands on that to the character, so a little short of
+// it still counts.
+const CUT_MARGIN = 10;
+
+// Whether a retweet's text stops short of its post. One that ends in an
+// ellipsis of the post's own does not: with the post all there, it is shorter.
+// `text` is the tidied text and `sent` the same text as X sent it. The length
+// is taken from that one, because tidying takes characters off: four for
+// every "&amp;", which would make a text that was cut look whole.
+function isCutShort(text, sent) {
+  return /…(?:\s*https?:\/\/t\.co\/\w+)?$/.test(text) && [...String(sent)].length >= RETWEET_CHARS - CUT_MARGIN;
+}
+
+// When the interaction happened. The envelope says so for every kind of event.
+// A like's own `created_at` is never asked: X documents it as when the liked
+// post was written, which may be years before anyone liked it.
+function occurredAt(event, kind) {
+  const { payload } = event;
+  return Date.parse(event.created_at)
+    || Number(payload.timestamp_ms)
+    || (kind === 'like' ? 0 : Date.parse(payload.created_at))
+    || Date.now();
 }
 
 // Turns an Activity API event into a display-ready notification, or null when
@@ -61,14 +89,23 @@ export function normalizeEvent(event, myId) {
       break;
     }
     case 'post.repost.create': {
-      const tweetId = refId(payload, 'retweeted') ?? payload.id ?? null;
+      const original = refId(payload, 'retweeted');
+      const tweetId = original ?? payload.id ?? null;
+      const whole = included(tweetId);
+      // Without the post itself, there is the retweet's own text: "RT @you: "
+      // and then the post, or as much of it as fits. That is marked as only
+      // the start when the post is known and can be asked for, so that the
+      // whole of it can still take its place.
+      const own = whole ? null : postText(payload);
+      const quoted = own?.replace(/^RT @\w+:\s*/, '') || null;
       details = {
         kind: 'retweet',
         actorId: payload.author_id,
         postId: payload.id ?? null,
         tweetId,
         text: null,
-        tweetText: included(tweetId) ?? (postText(payload)?.replace(/^RT @\w+:\s*/, '') || null),
+        tweetText: whole ?? quoted,
+        tweetTextPartial: Boolean(original && quoted && isCutShort(own, sentText(payload))),
       };
       break;
     }
@@ -95,11 +132,12 @@ export function normalizeEvent(event, myId) {
 
   return {
     conversationId: null,
+    tweetTextPartial: false,
     ...details,
     key: eventKey(event),
     actorHandle: rawHandle,
     actor: actorLabel(rawHandle, details.actorId),
-    createdAt: Date.parse(payload.created_at) || Date.now(),
+    createdAt: occurredAt(event, details.kind),
   };
 }
 
