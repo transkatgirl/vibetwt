@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -12,9 +12,9 @@ import {
 import { Mixer } from '../src/mixer.js';
 import { PATTERNS } from '../src/patterns.js';
 import { MAX_VOICES, PatternPlayer } from '../src/player.js';
-import { displayWidth, sanitizeText, truncate, wrap } from '../src/text.js';
+import { displayWidth, sanitizeText, singleLine, truncate, wordEndAfter, wordStartBefore, wrap } from '../src/text.js';
 import { toDeviceValue } from '../src/vibrator.js';
-import { JsonFrameSplitter } from '../src/x-stream.js';
+import { ActivityStream, JsonFrameSplitter } from '../src/x-stream.js';
 import { SubscriptionManager, TAG } from '../src/x-subscriptions.js';
 import { likeEvent, ME, OTHER, replyEvent, repostEvent } from './helpers.js';
 
@@ -104,6 +104,164 @@ test('cleanup removes only this app\'s subscriptions', async (t) => {
   assert.deepEqual(deleted, ['current']);
 });
 
+// X's docs say that creating a subscription which already exists refreshes it
+// and keeps it. With `refreshes: false`, this X makes a second one instead.
+function subscriptionApi({ refreshes }) {
+  const live = new Map();
+  let nextId = 1;
+  return {
+    live,
+    async json(method, path, body) {
+      if (method === 'GET') return { data: [...live.values()] };
+      if (method === 'DELETE') {
+        live.delete(path.split('/').at(-1));
+        return { data: { deleted: true } };
+      }
+      const existing = [...live.values()].find((item) => item.event_type === body.event_type);
+      const subscription_id = (refreshes && existing?.subscription_id) || String(nextId++);
+      live.set(subscription_id, { subscription_id, ...body });
+      return { data: { subscription: live.get(subscription_id) } };
+    },
+  };
+}
+
+test('renewal leaves one live subscription of each type, however X answers a repeat', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+
+  for (const refreshes of [true, false]) {
+    const stateDir = await mkdtemp(join(tmpdir(), 'vibetwt-test-'));
+    t.after(() => rm(stateDir, { recursive: true, force: true }));
+    const api = subscriptionApi({ refreshes });
+    const logs = [];
+    const manager = new SubscriptionManager(api, ME, { stateDir, log: (line) => logs.push(line) });
+    await manager.start();
+    const before = [...api.live.keys()];
+
+    t.mock.timers.tick(23 * 60 * 60_000);
+    for (let turn = 0; turn < 5000 && logs.length === 0; turn++) await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(logs, ['Renewed X subscriptions.']);
+
+    const label = refreshes ? 'refreshed in place' : 'replaced';
+    assert.deepEqual(
+      [...api.live.values()].map((item) => item.event_type).sort(),
+      ['like.create', 'post.reply.create', 'post.repost.create'],
+      label,
+    );
+    const kept = before.filter((id) => api.live.has(id));
+    assert.equal(kept.length, refreshes ? 3 : 0, label);
+    const saved = JSON.parse(await readFile(join(stateDir, 'subscriptions.json'), 'utf8'));
+    assert.deepEqual(saved.sort(), [...api.live.keys()].sort(), `${label}: the saved list matches X`);
+
+    await manager.stop();
+    assert.equal(api.live.size, 0, label);
+  }
+});
+
+test('stopping in the middle of a renewal still leaves nothing subscribed', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const turns = async (count) => {
+    for (let turn = 0; turn < count; turn++) await new Promise((resolve) => setImmediate(resolve));
+  };
+
+  for (const refreshes of [true, false]) {
+    const stateDir = await mkdtemp(join(tmpdir(), 'vibetwt-test-'));
+    t.after(() => rm(stateDir, { recursive: true, force: true }));
+    const api = subscriptionApi({ refreshes });
+    const logs = [];
+    const manager = new SubscriptionManager(api, ME, { stateDir, log: (line) => logs.push(line) });
+    await manager.start();
+
+    // The renewal's first request is held open, as a slow network would.
+    const held = Promise.withResolvers();
+    const answer = api.json;
+    api.json = async (method, ...rest) => {
+      if (method === 'POST') await held.promise;
+      return answer(method, ...rest);
+    };
+    t.mock.timers.tick(23 * 60 * 60_000);
+    await turns(5);
+
+    const stopping = manager.stop();
+    await turns(50);
+    held.resolve();
+    assert.deepEqual(await stopping, { deleted: 3 + (refreshes ? 0 : 1), failed: 0 });
+    await turns(50);
+    t.mock.timers.tick(24 * 60 * 60_000);
+    await turns(50);
+
+    const label = refreshes ? 'refreshed in place' : 'replaced';
+    assert.equal(api.live.size, 0, label);
+    assert.deepEqual(logs, [], `${label}: it neither finishes nor tries again`);
+    assert.deepEqual(JSON.parse(await readFile(join(stateDir, 'subscriptions.json'), 'utf8')), [], label);
+  }
+});
+
+// On Linux a timer does not count the time a machine spends asleep, but the
+// subscriptions go on expiring.
+test('a renewal that came due while the machine slept happens soon after it wakes', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let now = Date.parse('2026-11-22T09:00:00Z');
+  t.mock.method(Date, 'now', () => now);
+  const stateDir = await mkdtemp(join(tmpdir(), 'vibetwt-test-'));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const api = subscriptionApi({ refreshes: true });
+  const logs = [];
+  const manager = new SubscriptionManager(api, ME, { stateDir, log: (line) => logs.push(line) });
+  const turns = async () => {
+    for (let turn = 0; turn < 200; turn++) await new Promise((resolve) => setImmediate(resolve));
+  };
+  const awake = async (ms) => {
+    now += ms;
+    t.mock.timers.tick(ms);
+    await turns();
+  };
+  await manager.start();
+
+  await awake(8 * 60 * 60_000);
+  assert.deepEqual(logs, [], 'nothing is due yet');
+
+  // Asleep until after the renewal was due: the clock moves and no timer does.
+  now += 16 * 60 * 60_000;
+  await awake(60_000);
+  assert.deepEqual(logs, ['Renewed X subscriptions.']);
+  const expiries = [...api.live.values()].map((item) => Date.parse(item.expires_at));
+  assert.ok(expiries.every((expiry) => expiry > now + 23 * 60 * 60_000), 'with a fresh day ahead of them');
+
+  await manager.stop();
+});
+
+test('a reconnect that drops early asks again for what it was meant to recover', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const keepAlive = new TextEncoder().encode('\r\n');
+  const stop = new AbortController();
+  const queries = [];
+  const connections = [
+    async function* lastsThenDrops() {
+      yield keepAlive;
+      t.mock.timers.tick(40_000);
+      yield keepAlive;
+      t.mock.timers.tick(3 * 60_000);
+      throw new Error('dropped');
+    },
+    async function* dropsAtOnce() {
+      yield keepAlive;
+      throw new Error('dropped again');
+    },
+    async function* ends() {
+      stop.abort();
+    },
+  ];
+  const api = {
+    async openStream(query) {
+      queries.push(query);
+      return { body: connections[queries.length - 1]() };
+    },
+  };
+
+  await new ActivityStream({ api, onEvent() {} }).run(stop.signal);
+  assert.deepEqual(queries, [{}, { backfill_minutes: 3 }, { backfill_minutes: 3 }]);
+});
+
 test('classifies likes, retweets, and replies', () => {
   assert.equal(normalizeEvent(likeEvent(), ME).kind, 'like');
   assert.equal(normalizeEvent(repostEvent(), ME).kind, 'retweet');
@@ -138,6 +296,12 @@ test('extracts post text and handles from event payloads', () => {
   assert.equal(reply.text, '@me Great post');
   assert.equal(reply.conversationId, '99');
   assert.equal(reply.actor, `user ${OTHER}`);
+
+  // X's docs use both names for the full text of a long post.
+  for (const field of ['note_post', 'note_tweet']) {
+    const long = normalizeEvent(replyEvent('long', { text: 'The start…', [field]: { text: 'The start and the rest' } }), ME);
+    assert.equal(long.text, 'The start and the rest', field);
+  }
 });
 
 test('malformed includes do not throw', () => {
@@ -545,8 +709,16 @@ test('sanitizer removes terminal escapes and bidi controls from post text', () =
   assert.equal(sanitizeText('a\x1b[2J\x1b[31mb\x07c'), 'abc');
   assert.equal(sanitizeText('x\x9b31my'), 'xy');
   assert.equal(sanitizeText('safe‮txet'), 'safetxet');
-  assert.equal(sanitizeText('a &amp;lt; b'), 'a &lt; b');
   assert.equal(sanitizeText('line\r\nbreak'), 'line\nbreak');
+});
+
+// X sends a post's literal "&lt;" as "&amp;lt;". The list and the plain log
+// tidy text that was already read once, and must not read it again.
+test('post text has its escapes undone once, however often it is tidied', () => {
+  const reply = normalizeEvent(replyEvent('p', { text: 'use &amp;lt;b&amp;gt; &amp; not &lt;i&gt;' }), ME);
+  assert.equal(reply.text, 'use &lt;b&gt; & not <i>');
+  assert.equal(singleLine(reply.text), reply.text);
+  assert.equal(singleLine('AT&amp;T'), 'AT&amp;T', 'and text that is not from a post is left as it is');
 });
 
 test('text measurement handles wide characters and emoji', () => {
@@ -558,6 +730,33 @@ test('text measurement handles wide characters and emoji', () => {
   for (const line of wrap('a verylongwordthatmustbreak 日本語のテキスト 🏳️‍🌈 end', 8)) {
     assert.ok(displayWidth(line) <= 8, line);
   }
+});
+
+test('word jumps stop at letters and digits, on either side of punctuation', () => {
+  const stops = (text, step, from) => {
+    const seen = [];
+    for (let index = step(text, from); seen.at(-1) !== index; index = step(text, index)) seen.push(index);
+    return seen;
+  };
+  const filter = 'type:like,reply -from:@al_1ce (x.com OR "it\'s")';
+  assert.deepEqual(stops(filter, wordEndAfter, 0), [4, 9, 15, 21, 29, 32, 36, 39, 43, 45, 47]);
+  assert.deepEqual(stops(filter, wordStartBefore, filter.length), [44, 41, 37, 33, 31, 23, 17, 10, 5, 0]);
+  assert.equal(wordStartBefore(filter, 7), 5, 'from inside a word, to its start');
+  assert.equal(wordEndAfter(filter, 7), 9, 'and to its end');
+
+  assert.deepEqual(stops('日本語 café 👍🏽 naïve', wordEndAfter, 0), [3, 8, 20], 'accents stay inside their word');
+  assert.equal(wordStartBefore('((', 2), 0);
+  assert.equal(wordEndAfter('', 0), 0);
+
+  // The selector and joiners inside an emoji are not words: a stop at one
+  // would leave the cursor in the middle of the emoji.
+  const heart = 'text:❤️ cats';
+  const family = 'a \u{1f468}‍\u{1f469}‍\u{1f467} b';
+  assert.deepEqual(stops(heart, wordEndAfter, 0), [4, 12]);
+  assert.deepEqual(stops(heart, wordStartBefore, heart.length), [8, 0]);
+  assert.deepEqual(stops(family, wordEndAfter, 0), [1, 12]);
+  assert.deepEqual(stops(family, wordStartBefore, family.length), [11, 0]);
+  assert.deepEqual(stops('1️⃣ x', wordEndAfter, 0), [3, 5], 'while a keycap is still one word');
 });
 
 test('each desktop gets its own browser launcher, and a headless machine gets none', () => {

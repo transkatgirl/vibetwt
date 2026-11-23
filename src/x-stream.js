@@ -69,13 +69,14 @@ export class ActivityStream {
 
   async run(signal) {
     let failures = 0;
-    let lastDataAt = null;
+    // Everything up to this moment has been received.
+    let caughtUpAt = null;
     let backfillAllowed = true;
 
     while (!signal.aborted) {
       const connectedAt = Date.now();
-      const backfill = lastDataAt && backfillAllowed
-        ? Math.min(MAX_BACKFILL_MINUTES, Math.ceil((Date.now() - lastDataAt) / 60_000))
+      const backfill = caughtUpAt && backfillAllowed
+        ? Math.min(MAX_BACKFILL_MINUTES, Math.ceil((Date.now() - caughtUpAt) / 60_000))
         : 0;
       let wait = null;
 
@@ -87,9 +88,12 @@ export class ActivityStream {
         );
         this.#onStatus('live');
         this.#log(`Listening for X notifications${backfill ? ` (recovering up to ${backfill} min)` : ''}.`);
-        lastDataAt = Date.now();
+        const openedAt = Date.now();
+        caughtUpAt ??= openedAt;
+        // A connection that drops straight away may not have delivered what it
+        // was asked to recover, so the gap stays open until one has lasted.
         await this.#consume(res, stall, () => {
-          lastDataAt = Date.now();
+          if (Date.now() - openedAt >= STABLE_CONNECTION_MS) caughtUpAt = Date.now();
         });
         if (!signal.aborted) this.#log('X stream ended. Reconnecting.');
       } catch (error) {

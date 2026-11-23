@@ -1,7 +1,7 @@
 import { formatUsd, POST_READ_MICROS, USER_READ_MICROS } from './cost.js';
-import { actorLabel, collectKnown, Deduper, eventKey, normalizeEvent } from './events.js';
+import { actorLabel, collectKnown, Deduper, eventKey, normalizeEvent, postText } from './events.js';
 import { EMPTY_FILTER, filterUsernames, matchesFilter } from './filter.js';
-import { sanitizeText, singleLine } from './text.js';
+import { singleLine } from './text.js';
 
 const MAX_EVENTS = 1000;
 const MAX_KNOWN = 5000;
@@ -220,17 +220,18 @@ export class Session {
     this.changed();
   }
 
-  // What a paid lookup would cost for this event, or 0 if nothing is missing.
+  // What a paid lookup would cost for this event, or 0 if nothing is missing:
+  // a post read for the text, and a user read for the name.
   lookupEstimate(event) {
     if (!event) return 0;
     return (event.tweetId && !event.tweetText ? POST_READ_MICROS : 0)
-      + (event.postId && !event.actorHandle ? POST_READ_MICROS + USER_READ_MICROS : 0);
+      + (event.actorHandle ? 0 : USER_READ_MICROS);
   }
 
   async lookup(event) {
     if (!event || this.#lookups.has(event.key)) return;
     const needsTweet = Boolean(event.tweetId && !event.tweetText);
-    const needsActor = Boolean(event.postId && !event.actorHandle);
+    const needsActor = !event.actorHandle;
     if (!needsTweet && !needsActor) {
       this.notify('Nothing to fetch for this event.');
       return;
@@ -239,10 +240,18 @@ export class Session {
     this.#lookups.add(event.key);
     this.notify('Fetching from X…');
     try {
-      if (needsTweet) await this.#fetch([event.tweetId], false);
-      if (needsActor) await this.#fetch([event.postId], true);
-      const missing = (needsTweet && !event.tweetText) || (needsActor && !event.actorHandle);
-      this.notify(missing ? 'X did not return that tweet. It may be deleted or private.' : 'Fetched.');
+      if (needsTweet) await this.#fetchPosts([event.tweetId]);
+      // Every event names its actor by ID, so the account is read on its own.
+      // Reading it through a reply or retweet would be billed as a post too.
+      if (needsActor) await this.#fetchUsers([event.actorId]);
+
+      if (needsTweet && !event.tweetText) {
+        this.notify('X did not return that tweet. It may be deleted or private.');
+      } else if (needsActor && !event.actorHandle) {
+        this.notify('X did not return that user. The account may be suspended or deleted.');
+      } else {
+        this.notify('Fetched.');
+      }
     } catch (error) {
       this.notify(`Fetch failed: ${error.message}`);
     } finally {
@@ -250,17 +259,24 @@ export class Session {
     }
   }
 
-  async #fetch(ids, withAuthors) {
-    const { posts, users } = await this.#api.lookupPosts(ids, { withAuthors });
-    this.cost.recordLookup({ posts: posts.map((post) => post.id), users: users.map((user) => user.id) });
+  async #fetchPosts(ids) {
+    const posts = await this.#api.lookupPosts(ids);
+    this.cost.recordLookup({ posts: posts.map((post) => post.id) });
     this.#learn({
       tweets: posts
-        .filter((post) => post?.id && post.text)
-        .map((post) => ({ id: String(post.id), text: sanitizeText(post.note_tweet?.text ?? post.text) })),
-      users: users
-        .filter((user) => user?.id && user.username)
-        .map((user) => ({ id: String(user.id), username: singleLine(user.username) })),
+        .filter((post) => post?.id && postText(post))
+        .map((post) => ({ id: String(post.id), text: postText(post) })),
+      users: [],
     });
+    this.changed();
+  }
+
+  async #fetchUsers(ids) {
+    const users = (await this.#api.lookupUsersById(ids))
+      .filter((user) => user?.id && user.username)
+      .map((user) => ({ id: String(user.id), username: singleLine(user.username) }));
+    this.cost.recordLookup({ users: users.map((user) => user.id) });
+    this.#learn({ tweets: [], users });
     this.changed();
   }
 

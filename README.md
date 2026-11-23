@@ -216,6 +216,9 @@ vibetwt creates its X subscriptions on start and deletes them on exit, because X
 event whether or not anyone is there to feel it. They also expire within 24 hours if it
 crashes. To remove them by hand, run `npm run cleanup`.
 
+Deleting them takes a moment after you quit. A second `Ctrl+C` skips the wait and leaves
+them behind, for `npm run cleanup` or the next start to remove.
+
 ## Configure
 
 Settings live in `.env`, in the directory you run vibetwt from. The same names work as
@@ -225,7 +228,7 @@ ordinary environment variables.
 |---|---|---|
 | `X_CLIENT_ID` | | Your X app's OAuth 2.0 client ID. Required. |
 | `X_CLIENT_SECRET` | | Its OAuth 2.0 client secret. Only needed if the app is a "confidential client". |
-| `X_BEARER_TOKEN` | | Its app-only bearer token, used to open the activity stream. |
+| `X_BEARER_TOKEN` | | Its app-only bearer token, used to open the activity stream. Required. |
 | `X_REDIRECT_URI` | `http://127.0.0.1:8976/callback` | Where the login comes back to. Must exactly match a callback URL registered on your X app. |
 | `BUTTPLUG_URL` | `ws://127.0.0.1:12345` | Intiface Central's server address. |
 

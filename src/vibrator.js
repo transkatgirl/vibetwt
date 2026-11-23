@@ -26,8 +26,22 @@ class ResilientSocket extends WebSocket {
   }
 }
 
+// The library keeps a socket to itself until it has opened, and can only close
+// it after that. One left opening would connect later, to a client that has
+// been given up on.
 class Connector extends ButtplugNodeWebsocketClientConnector {
-  _websocketConstructor = ResilientSocket;
+  #socket = null;
+
+  _websocketConstructor = ((connector) => class extends ResilientSocket {
+    constructor(...args) {
+      super(...args);
+      connector.#socket = this;
+    }
+  })(this);
+
+  abandon() {
+    this.#socket?.terminate();
+  }
 }
 
 // The library's own keep-alive is disabled, so servers with a ping timeout
@@ -65,12 +79,23 @@ export class Vibrator {
   #loop = null;
   #closed = false;
   #abort = new AbortController();
+  // Made up front, because a listener added after the abort would never run.
+  #closing = new Promise((resolve) => this.#abort.signal.addEventListener('abort', resolve, { once: true }));
+  #rescanMs;
+  #connectTimeoutMs;
+  // The scan each connection is waiting on. The library keeps its own record,
+  // but that counts a scan from the moment it is asked for, and goes on
+  // counting one the server refused.
+  #scans = new WeakMap();
+  #scanError = '';
   onChange = () => {};
 
-  constructor({ url, log = () => {}, commandTimeoutMs = 2000 }) {
+  constructor({ url, log = () => {}, commandTimeoutMs = 2000, rescanMs = 2000, connectTimeoutMs = 5000 }) {
     this.#url = url;
     this.#log = log;
     this.#timeoutMs = commandTimeoutMs;
+    this.#rescanMs = rescanMs;
+    this.#connectTimeoutMs = connectTimeoutMs;
   }
 
   start() {
@@ -133,11 +158,14 @@ export class Vibrator {
   }
 
   async #command(promise) {
+    // The connection this command went out on. By the time it is given up on,
+    // a new one may have taken its place, and that one has done nothing wrong.
+    const connector = this.#connector;
     try {
       return await withTimeout(promise, this.#timeoutMs);
     } catch (error) {
       // A silent server may have lost the connection. Closing forces a reconnect.
-      if (error instanceof CommandTimeout) await this.#connector?.disconnect().catch(() => {});
+      if (error instanceof CommandTimeout) await connector?.disconnect().catch(() => {});
       throw error;
     }
   }
@@ -153,21 +181,28 @@ export class Vibrator {
       this.#watchDevices(client);
 
       try {
-        await withTimeout(client.connect(connector), 5000);
+        await withTimeout(client.connect(connector), this.#connectTimeoutMs);
+        // close() had nothing to disconnect if it was called while this connected.
+        if (this.#closed) {
+          await connector.disconnect().catch(() => {});
+          return;
+        }
         this.#client = client;
         this.#connector = connector;
         client.startPing();
         backoff = 1000;
         lastError = '';
+        this.#scanError = '';
         this.#log(`Connected to ${client.serverInfo?.serverName ?? 'Buttplug server'}.`);
         this.#updateScanning(client);
         this.onChange();
 
-        await Promise.race([disconnected, this.#closedSignal()]);
+        await Promise.race([disconnected, this.#closing]);
         client.stopPing();
         if (!this.#closed) this.#log('Lost connection to Intiface. Reconnecting.');
       } catch (error) {
         await connector.disconnect().catch(() => {});
+        connector.abandon();
         if (error.message !== lastError) {
           lastError = error.message;
           this.#log(`Waiting for Intiface at ${this.#url} (${error.message}). Is its server started?`);
@@ -181,10 +216,6 @@ export class Vibrator {
       await delay(backoff, undefined, { signal: this.#abort.signal }).catch(() => {});
       backoff = Math.min(backoff * 2, 15_000);
     }
-  }
-
-  #closedSignal() {
-    return new Promise((resolve) => this.#abort.signal.addEventListener('abort', resolve, { once: true }));
   }
 
   #watchDevices(client) {
@@ -205,16 +236,50 @@ export class Vibrator {
       this.#updateScanning(client);
       this.onChange();
     });
+    // A server can end a scan on its own, with nothing found.
+    client.on('scanningfinished', () => this.#scanEnded(client));
   }
 
   #updateScanning(client) {
     if (!client.connected || this.#closed) return;
     const hasMotor = [...client.devices.values()].some((device) => device.hasOutput(OutputType.Vibrate));
-    const change = hasMotor
-      ? client.isScanning && client.stopScanning()
-      : !client.isScanning && client.startScanning();
-    if (change) {
-      withTimeout(change, this.#timeoutMs).catch((error) => this.#log(`Device scan problem: ${error.message}`));
+    if (hasMotor) {
+      this.#scans.delete(client);
+      if (client.isScanning) this.#scanRequest(client.stopScanning());
+      return;
+    }
+    if (this.#scans.has(client)) return;
+
+    const scan = client.startScanning();
+    this.#scans.set(client, scan);
+    // A scan the server refused is not running, so it will never end either.
+    this.#scanRequest(scan).then((started) => {
+      if (!started && this.#scans.get(client) === scan) this.#scanEnded(client);
+    });
+  }
+
+  // Start another after a pause, in case the server ends or refuses them as
+  // fast as they are asked for.
+  #scanEnded(client) {
+    this.#scans.delete(client);
+    delay(this.#rescanMs, undefined, { signal: this.#abort.signal })
+      .then(() => this.#updateScanning(client))
+      .catch(() => {});
+  }
+
+  // Resolves to whether the server agreed. A refusal is reported once, since
+  // asking again mostly gets the same answer.
+  async #scanRequest(request) {
+    try {
+      await withTimeout(request, this.#timeoutMs);
+      this.#scanError = '';
+      return true;
+    } catch (error) {
+      if (error.message !== this.#scanError) {
+        this.#scanError = error.message;
+        this.#log(`Device scan problem: ${error.message}`);
+      }
+      return false;
     }
   }
 }

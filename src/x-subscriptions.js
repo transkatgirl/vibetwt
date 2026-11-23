@@ -8,6 +8,7 @@ const PATH = '/2/activity/subscriptions';
 const TTL_MS = 24 * 60 * 60_000;
 const RENEW_BEFORE_MS = 60 * 60_000;
 const RETRY_MS = 5 * 60_000;
+const CHECK_MS = 60_000;
 
 export const subscriptionSpecs = (userId) => [
   { event_type: 'like.create', filter: { user_id: userId, direction: 'inbound' } },
@@ -25,6 +26,8 @@ export class SubscriptionManager {
   #log;
   #active = new Map();
   #timer = null;
+  #renewing = null;
+  #stopped = false;
 
   constructor(api, userId, { stateDir, log = () => {} }) {
     this.#api = api;
@@ -35,13 +38,18 @@ export class SubscriptionManager {
   }
 
   async start() {
+    this.#stopped = false;
     await this.cleanup();
     await this.#createAll();
     this.#schedule(TTL_MS - RENEW_BEFORE_MS);
   }
 
+  // A renewal under way would go on creating subscriptions after the cleanup,
+  // so it is told to stop where it is, and waited for first.
   async stop() {
+    this.#stopped = true;
     clearTimeout(this.#timer);
+    await this.#renewing;
     return this.cleanup();
   }
 
@@ -77,6 +85,7 @@ export class SubscriptionManager {
     const expires_at = new Date(Date.now() + TTL_MS).toISOString();
 
     for (const spec of subscriptionSpecs(this.#userId)) {
+      if (this.#stopped) return;
       const body = { ...spec, tag: TAG, expires_at };
       let id;
       try {
@@ -89,13 +98,18 @@ export class SubscriptionManager {
         id = await this.#create(body);
       }
       this.#active.set(spec.event_type, id);
-      await this.#persist([...this.#active.values(), ...previous.values()]);
+      await this.#persist([...new Set([...this.#active.values(), ...previous.values()])]);
     }
 
+    // X documents a repeat of an existing subscription as a refresh that keeps
+    // it, so an ID that came back again is the live one and must stay.
+    const live = new Set(this.#active.values());
     for (const id of previous.values()) {
+      if (this.#stopped) return;
+      if (live.has(id)) continue;
       await this.#delete(id).catch((error) => this.#log(`Could not delete old subscription ${id}: ${error.message}`));
     }
-    await this.#persist([...this.#active.values()]);
+    await this.#persist([...live]);
   }
 
   async #create(body) {
@@ -114,18 +128,36 @@ export class SubscriptionManager {
     }
   }
 
+  // A renewal is due at a time on the clock, so the clock is what gets
+  // checked. One long timer stops counting while the machine sleeps, as timers
+  // do on Linux, and would fire after the subscriptions had already expired.
   #schedule(ms) {
-    this.#timer = setTimeout(async () => {
-      try {
-        await this.#createAll();
-        this.#log('Renewed X subscriptions.');
-        this.#schedule(TTL_MS - RENEW_BEFORE_MS);
-      } catch (error) {
-        this.#log(`Subscription renewal failed, retrying in 5 minutes: ${error.message}`);
-        this.#schedule(RETRY_MS);
+    const due = Date.now() + ms;
+    const check = () => {
+      const left = due - Date.now();
+      if (left > 0) {
+        this.#timer = setTimeout(check, Math.min(left, CHECK_MS));
+        this.#timer.unref();
+        return;
       }
-    }, ms);
-    this.#timer.unref();
+      this.#renewing = this.#renew().finally(() => {
+        this.#renewing = null;
+      });
+    };
+    check();
+  }
+
+  async #renew() {
+    try {
+      await this.#createAll();
+      if (this.#stopped) return;
+      this.#log('Renewed X subscriptions.');
+      this.#schedule(TTL_MS - RENEW_BEFORE_MS);
+    } catch (error) {
+      if (this.#stopped) return;
+      this.#log(`Subscription renewal failed, retrying in 5 minutes: ${error.message}`);
+      this.#schedule(RETRY_MS);
+    }
   }
 
   async #savedIds() {

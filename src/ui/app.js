@@ -1,7 +1,7 @@
 import {
   EMPTY_FILTER, formatFilter, parseFilter, toggleKind, withoutUser, withTweet, withUser,
 } from '../filter.js';
-import { graphemes, singleLine } from '../text.js';
+import { graphemes, singleLine, wordEndAfter, wordStartBefore } from '../text.js';
 import { KeyParser } from './keys.js';
 import { layout, renderScreen } from './render.js';
 
@@ -18,6 +18,7 @@ export class Tui {
   #stdin;
   #stdout;
   #onQuit;
+  #onInterrupt;
   #color;
   #parser = new KeyParser();
   #selectedKey = null;
@@ -29,12 +30,21 @@ export class Tui {
   #active = false;
   #console = null;
 
-  constructor(session, { stdin = process.stdin, stdout = process.stdout, onQuit, color = !process.env.NO_COLOR }) {
+  // `onQuit` asks for a clean exit. `onInterrupt` is Ctrl+C, which the caller
+  // may treat as more insistent when it is pressed again.
+  constructor(session, {
+    stdin = process.stdin, stdout = process.stdout, onQuit, onInterrupt = onQuit, color = !process.env.NO_COLOR,
+  }) {
     this.#session = session;
     this.#stdin = stdin;
     this.#stdout = stdout;
     this.#onQuit = onQuit;
+    this.#onInterrupt = onInterrupt;
     this.#color = color;
+  }
+
+  get active() {
+    return this.#active;
   }
 
   start() {
@@ -74,7 +84,11 @@ export class Tui {
   #restore = () => {
     if (!this.#active) return;
     this.#active = false;
-    this.#stdin.setRawMode(false);
+    try {
+      this.#stdin.setRawMode(false);
+    } catch {
+      // The terminal is gone. What comes after a quit still has to happen.
+    }
     this.#stdout.write(LEAVE_SCREEN);
   };
 
@@ -169,7 +183,7 @@ export class Tui {
 
   handleKey(key) {
     if (key.name === 'ctrl-c') {
-      this.#onQuit();
+      this.#onInterrupt();
       return;
     }
     if (this.#edit) this.#editKey(key);
@@ -261,8 +275,11 @@ export class Tui {
     const { text, cursor } = edit;
     const before = text.slice(0, cursor);
     const after = text.slice(cursor);
+    // Option+← and Option+→ arrive as a marked arrow or as a key of their own,
+    // depending on the terminal. Outside the prompt, neither means anything new.
+    const name = key.alt && (key.name === 'left' || key.name === 'right') ? `word${key.name}` : key.name;
 
-    switch (key.name) {
+    switch (name) {
       case 'char': this.#setDraft(before + key.text + after, cursor + key.text.length); break;
       case 'paste': {
         const pasted = singleLine(key.text);
@@ -281,6 +298,15 @@ export class Tui {
       }
       case 'left': edit.cursor -= graphemes(before).at(-1)?.length ?? 0; break;
       case 'right': edit.cursor += graphemes(after)[0]?.length ?? 0; break;
+      case 'wordleft': edit.cursor = wordStartBefore(text, cursor); break;
+      case 'wordright': edit.cursor = wordEndAfter(text, cursor); break;
+      // Option+Delete removes what Option+← would cross. iTerm2's natural text
+      // editing sends it as Ctrl+W.
+      case 'wordbackspace': case 'ctrl-w': {
+        const start = wordStartBefore(text, cursor);
+        if (start < cursor) this.#setDraft(text.slice(0, start) + after, start);
+        break;
+      }
       case 'home': case 'ctrl-a': edit.cursor = 0; break;
       case 'end': case 'ctrl-e': edit.cursor = text.length; break;
       case 'ctrl-u': this.#setDraft(after, 0); break;

@@ -17,6 +17,7 @@ const USAGE = `Usage:
   npm start -- --plain          Print a simple log instead of the dashboard
   npm run try -- [like|retweet|reply]  Play patterns without X
   npm run cleanup               Remove this app's X subscriptions`;
+const FLAGS = ['--no-device', '--plain'];
 
 async function tryPatterns(config, kinds, noDevice) {
   for (const kind of kinds) {
@@ -60,6 +61,10 @@ async function main() {
   const flags = rest.filter((arg) => arg.startsWith('--'));
   const args = rest.filter((arg) => !arg.startsWith('--'));
   const noDevice = flags.includes('--no-device');
+
+  // A mistyped --no-device must not go on to run with the device on.
+  const unknown = [...flags.filter((flag) => !FLAGS.includes(flag)), ...(command === 'try' ? [] : args)];
+  if (unknown.length > 0) throw new Error(`Unknown option "${unknown[0]}".\n\n${USAGE}`);
 
   loadEnvFile();
   const config = loadConfig();

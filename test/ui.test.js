@@ -14,7 +14,7 @@ import { renderScreen } from '../src/ui/render.js';
 import { NullOutput } from '../src/vibrator.js';
 import { likeEvent, ME, OTHER, replyEvent, repostEvent } from './helpers.js';
 
-function harness({ cols = 100, rows = 30, api = {} } = {}) {
+function harness({ cols = 100, rows = 30, api = {}, onInterrupt } = {}) {
   const output = new NullOutput();
   const played = [];
   const mixer = new Mixer(output, { intensity: 0.6 });
@@ -35,10 +35,11 @@ function harness({ cols = 100, rows = 30, api = {} } = {}) {
     columns: cols, rows, write(text) { written += text; },
   });
   let quits = 0;
-  const tui = new Tui(session, { stdin, stdout, color: true, onQuit: () => { quits++; } });
+  const tui = new Tui(session, { stdin, stdout, color: true, onQuit: () => { quits++; }, onInterrupt });
   return {
     session,
     tui,
+    stdin,
     player,
     played,
     send: (text) => stdin.emit('data', text),
@@ -71,6 +72,25 @@ test('key parser reads arrows, escape, unicode, and split sequences', () => {
   assert.deepEqual(parser.push('\x1b['), []);
   assert.deepEqual(parser.push('B').map((key) => key.name), ['down']);
   assert.deepEqual(parser.push('\x1b[5~\x03').map((key) => key.name), ['pageup', 'ctrl-c']);
+});
+
+test('an Alt or Option key is never Escape and then the key', () => {
+  const parser = new KeyParser();
+  assert.deepEqual(parser.push('\x1bf\x1bb'), [{ name: 'wordright' }, { name: 'wordleft' }], 'as Terminal.app sends Option+→ and Option+←');
+  assert.deepEqual(parser.push('\x1b\x7f\x1b\b'), [{ name: 'wordbackspace' }, { name: 'wordbackspace' }], 'and Option+Delete');
+  assert.deepEqual(parser.push('\x1bq\x1b\r\x1b😀'), [], 'one with no meaning here is nothing at all');
+  assert.deepEqual(
+    parser.push('\x1b\x1b[D\x1b[1;3C\x1b[1;9D'),
+    [{ name: 'left', alt: true }, { name: 'right', alt: true }, { name: 'left', alt: true }],
+    'an arrow is still that arrow, and says how it was pressed',
+  );
+  assert.deepEqual(parser.push('\x1b[D\x1b[1;5C\x1b[1;2D\x1bOC'), [{ name: 'left' }, { name: 'right' }, { name: 'left' }, { name: 'right' }]);
+  assert.deepEqual(parser.push('\x1b\x1b'), []);
+  assert.deepEqual(parser.flush().map((key) => key.name), ['escape', 'escape'], 'Escape twice is still Escape twice');
+  assert.deepEqual(parser.push('\x1b\x03').map((key) => key.name), ['escape', 'ctrl-c'], 'ctrl+c always gets through');
+  assert.deepEqual(parser.push('\x1b'), []);
+  assert.deepEqual(parser.push('f'), [{ name: 'escape' }, { name: 'char', text: 'f' }], 'Escape and then a key are both keys');
+  assert.deepEqual(parser.push('\x1b\x1b[200~q\x1b[201~'), [{ name: 'escape' }, { name: 'paste', text: 'q' }]);
 });
 
 test('a paste arrives as one key, even split across chunks', () => {
@@ -184,6 +204,138 @@ test('typing q or space in the filter prompt does not quit or pause', () => {
   app.send('\x03');
   assert.equal(app.quits(), 1, 'ctrl+c always quits');
   app.tui.stop();
+});
+
+test('Option+arrow in the filter prompt keeps the draft and fires no shortcut', async () => {
+  const fetched = [];
+  const api = {
+    async lookupPosts(ids) {
+      fetched.push(ids);
+      return [];
+    },
+  };
+  const app = harness({ api });
+  app.tui.start();
+  seed(app.session);
+  assert.ok(app.tui.view().lookupEstimate > 0, 'f would cost something here');
+
+  app.send('/');
+  app.send('type:reply');
+  app.send('\x1bf');
+  app.send('\x1bb');
+  app.send('\x1bq');
+  assert.equal(app.tui.view().edit.text, 'type:reply');
+  app.send('\r');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(app.session.filter.kinds, ['reply']);
+  assert.deepEqual(fetched, []);
+  assert.equal(app.quits(), 0);
+  app.tui.stop();
+  app.player.setPaused(true);
+});
+
+test('Option+arrow jumps by word in the filter prompt, however the terminal sends it', () => {
+  const app = harness();
+  app.tui.start();
+  const cursor = () => app.tui.view().edit.cursor;
+  const draft = 'type:reply from:@some_one "two words"';
+
+  for (const [label, left, right] of [
+    ['Terminal.app', '\x1bb', '\x1bf'],
+    ['iTerm2', '\x1b[1;3D', '\x1b[1;3C'],
+    ['iTerm2, older', '\x1b[1;9D', '\x1b[1;9C'],
+    ['Option as Meta', '\x1b\x1b[D', '\x1b\x1b[C'],
+  ]) {
+    app.send('/');
+    app.send(draft);
+    const stops = [draft.length];
+    for (let press = 0; press < 7; press++) {
+      app.send(left);
+      stops.push(cursor());
+    }
+    assert.deepEqual(stops, [37, 31, 27, 17, 11, 5, 0, 0], `${label}: left to each word's start, then stays`);
+    stops.length = 0;
+    for (let press = 0; press < 7; press++) {
+      app.send(right);
+      stops.push(cursor());
+    }
+    assert.deepEqual(stops, [4, 10, 15, 25, 30, 36, 37], `${label}: right to each word's end, then the line's`);
+
+    app.send(left);
+    app.send(left);
+    app.send('X');
+    assert.equal(app.tui.view().edit.text, 'type:reply from:@some_one "Xtwo words"', `${label}: typing goes where it landed`);
+    app.tui.handleKey({ name: 'escape' });
+  }
+
+  // Outside the prompt an arrow is the arrow it always was, and the rest is nothing.
+  app.send('\x1bf');
+  app.send('\x1bb');
+  assert.equal(app.session.intensityPct, 60);
+  app.send('\x1b[1;3C');
+  assert.equal(app.session.intensityPct, 65);
+  app.tui.stop();
+  app.player.setPaused(true);
+});
+
+test('Option+Delete removes the word before the cursor, however the terminal sends it', () => {
+  const app = harness();
+  app.tui.start();
+  seed(app.session);
+  const edit = () => app.tui.view().edit;
+
+  for (const [label, key] of [['Option as Meta', '\x1b\x7f'], ['backspace as ^H', '\x1b\b'], ['iTerm2 natural text editing', '\x17']]) {
+    app.send('/');
+    app.send('type:reply from:@some_one (');
+    const drafts = [];
+    for (let press = 0; press < 5; press++) {
+      app.send(key);
+      drafts.push(edit().text);
+    }
+    assert.deepEqual(
+      drafts,
+      ['type:reply from:@', 'type:reply ', 'type:', '', ''],
+      `${label}: a word and what follows it, then nothing once the line is empty`,
+    );
+
+    app.send('from:@alice cats');
+    app.send('\x1bb');
+    app.send(key);
+    assert.deepEqual([edit().text, edit().cursor], ['from:@cats', 6], `${label}: what comes after the cursor stays`);
+    assert.equal(formatFilter(edit().preview), 'from:@cats', `${label}: and the preview follows`);
+    app.tui.handleKey({ name: 'escape' });
+
+    // Outside the prompt it is not a shortcut for anything.
+    app.send(key);
+    assert.equal(formatFilter(app.session.filter), '');
+    assert.equal(app.session.intensityPct, 60);
+    assert.equal(app.tui.view().edit, null);
+  }
+  app.tui.stop();
+  app.player.setPaused(true);
+});
+
+test('q only ever asks to quit, while ctrl+c is reported apart so that it can insist', () => {
+  let interrupts = 0;
+  const app = harness({ onInterrupt: () => { interrupts++; } });
+  app.tui.start();
+  app.send('qq');
+  assert.equal(app.quits(), 2);
+  assert.equal(interrupts, 0);
+  app.send('\x03\x03');
+  assert.equal(app.quits(), 2);
+  assert.equal(interrupts, 2);
+  app.tui.stop();
+});
+
+test('leaving still works when the terminal is already gone', () => {
+  const app = harness();
+  const original = console.log;
+  app.tui.start();
+  app.stdin.setRawMode = () => { throw Object.assign(new Error('setRawMode EIO'), { code: 'EIO' }); };
+  app.tui.stop();
+  assert.equal(console.log, original);
+  assert.ok(app.written().endsWith('\x1b[?1049l'), 'everything after the failure still ran');
 });
 
 test('pasting a post URL filters to it without firing shortcuts', () => {
@@ -449,28 +601,65 @@ test('selection stays on its event as new ones arrive', () => {
 test('fetch is manual, shows its price, adds to cost, and fills in details', async () => {
   const calls = [];
   const api = {
-    async lookupPosts(ids, { withAuthors }) {
-      calls.push({ ids, withAuthors });
-      return ids[0] === '101'
-        ? { posts: [{ id: '101', text: 'The original post' }], users: [] }
-        : { posts: [{ id: '200', author_id: '3', text: 'RT' }], users: [{ id: '3', username: 'bob' }] };
+    async lookupPosts(ids) {
+      calls.push({ posts: ids });
+      return [{ id: '101', text: 'The original…', note_post: { text: 'The original post' } }];
+    },
+    async lookupUsersById(ids) {
+      calls.push({ users: ids });
+      return [{ id: '3', username: 'bob' }];
     },
   };
   const app = harness({ api });
   app.tui.start();
   app.session.receive(repostEvent('200', { author_id: '3', referenced_tweets: [{ type: 'retweeted', id: '101' }] }));
   assert.equal(calls.length, 0, 'nothing is fetched automatically');
-  assert.match(app.screen().join('\n'), /f fetch missing info ~\$0\.020/);
+  assert.match(app.screen().join('\n'), /f fetch missing info ~\$0\.015/);
 
   app.send('f');
   app.send('f');
   await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.equal(calls.length, 2, 'a double press does not fetch twice');
+  assert.deepEqual(
+    calls,
+    [{ posts: ['101'] }, { users: ['3'] }],
+    'a double press does not fetch twice, and the retweet itself is not paid for to learn who made it',
+  );
   const event = app.session.events[0];
   assert.equal(event.tweetText, 'The original post');
   assert.equal(event.actor, '@bob');
-  assert.equal(app.session.cost.snapshot().lookups.micros, 20_000);
+  assert.equal(app.session.cost.snapshot().lookups.micros, 15_000);
   assert.doesNotMatch(app.screen().join('\n'), /fetch missing info/);
+  app.tui.stop();
+  app.player.setPaused(true);
+});
+
+test('fetch names whoever liked a post, though a like has no post of theirs to ask for', async () => {
+  const calls = [];
+  const api = {
+    async lookupUsersById(ids) {
+      calls.push(ids);
+      return ids[0] === OTHER ? [{ id: OTHER, username: 'alice' }] : [];
+    },
+  };
+  const app = harness({ api });
+  app.tui.start();
+  const liked = { tweets: [{ id: '100', text: 'My first post' }] };
+  app.session.receive({ ...likeEvent('l1', { liked_tweet_id: '100' }), includes: liked });
+  assert.equal(app.session.events[0].actor, `user ${OTHER}`);
+  assert.match(app.screen().join('\n'), /f fetch missing info ~\$0\.010/);
+
+  app.send('f');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(calls, [[OTHER]]);
+  assert.equal(app.session.events[0].actor, '@alice');
+  assert.equal(app.session.cost.snapshot().lookups.micros, 10_000);
+  assert.doesNotMatch(app.screen().join('\n'), /fetch missing info/);
+
+  app.session.receive({ ...likeEvent('l2', { liked_tweet_id: '100', liking_user_id: '5' }), includes: liked });
+  app.send('f');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.match(app.session.notice, /X did not return that user/);
+  assert.equal(app.session.cost.snapshot().lookups.micros, 10_000, 'nothing found, nothing billed');
   app.tui.stop();
   app.player.setPaused(true);
 });

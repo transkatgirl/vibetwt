@@ -29,9 +29,16 @@ async function toError(res) {
   return new XApiError(res.status, String(detail).slice(0, 300), retryAfter(res.headers));
 }
 
+// The ways X's docs give to ask for the full text of a long post, which it
+// otherwise cuts off at 280 characters. Its API reference gives the first and
+// its data dictionary the second. Asking for nothing comes last, because the
+// short text is still worth having.
+const FULL_TEXT_FIELDS = ['post.fields=note_post', 'tweet.fields=note_tweet', ''];
+
 export class XApi {
   #config;
   #auth;
+  #fullText = 0;
 
   constructor(config, auth) {
     this.#config = config;
@@ -48,18 +55,35 @@ export class XApi {
     return text ? JSON.parse(text) : null;
   }
 
-  // Billed per post and user returned, so only called when the user asks.
-  async lookupPosts(ids, { withAuthors = false } = {}) {
-    const query = new URLSearchParams({ ids: ids.join(','), 'post.fields': 'author_id' });
-    if (withAuthors) query.set('expansions', 'author_id');
-    const response = await this.json('GET', `/2/tweets?${query}`);
-    return { posts: response?.data ?? [], users: response?.includes?.users ?? [] };
+  // Billed per post returned, so only called when the user asks.
+  async lookupPosts(ids) {
+    const query = new URLSearchParams({ ids: ids.join(',') });
+    // A way of asking that X refuses gives way to the next. The one that
+    // worked is where the next lookup starts, so a refusal is not paid for
+    // with another request every time.
+    for (let index = this.#fullText; ; index++) {
+      const fields = FULL_TEXT_FIELDS[index];
+      try {
+        const response = await this.json('GET', `/2/tweets?${query}${fields && `&${fields}`}`);
+        this.#fullText = index;
+        return response?.data ?? [];
+      } catch (error) {
+        if (!(error instanceof XApiError) || error.status !== 400 || !fields) throw error;
+      }
+    }
   }
 
   // Billed per user returned. X accepts up to 100 usernames per request.
   async lookupUsers(usernames) {
     const query = new URLSearchParams({ usernames: usernames.join(',') });
     const response = await this.json('GET', `/2/users/by?${query}`);
+    return response?.data ?? [];
+  }
+
+  // The same for account IDs, so only called when the user asks.
+  async lookupUsersById(ids) {
+    const query = new URLSearchParams({ ids: ids.join(',') });
+    const response = await this.json('GET', `/2/users?${query}`);
     return response?.data ?? [];
   }
 
@@ -88,7 +112,7 @@ export class XApi {
   }
 
   async #send(method, path, options) {
-    let lastError;
+    let refusal;
     for (const credential of this.#credentials(options.prefer)) {
       let res = await this.#fetch(method, path, await credential.token(false), options);
       if (res.status === 401 && credential.name === 'user') {
@@ -99,8 +123,10 @@ export class XApi {
 
       const error = await toError(res);
       if (error.status !== 401 && error.status !== 403) throw error;
-      lastError = error;
+      // The first token is the one meant for this request, so its refusal is
+      // the one that says what is wrong.
+      refusal ??= error;
     }
-    throw lastError;
+    throw refusal;
   }
 }

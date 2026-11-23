@@ -1,7 +1,11 @@
-import { sanitizeText, singleLine } from './text.js';
+import { decodeEntities, sanitizeText, singleLine } from './text.js';
 
 const list = (value) => (Array.isArray(value) ? value : []);
-const postText = (post) => sanitizeText(post?.note_tweet?.text ?? post?.text) || null;
+// A long post carries its full text apart from `text`. X's API reference calls
+// that field `note_post`, and its data dictionary `note_tweet`.
+export const postText = (post) => (
+  decodeEntities(sanitizeText(post?.note_post?.text ?? post?.note_tweet?.text ?? post?.text)) || null
+);
 
 export const actorLabel = (handle, id) => (handle ? `@${handle}` : `user ${id}`);
 

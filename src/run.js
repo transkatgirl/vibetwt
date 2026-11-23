@@ -12,13 +12,25 @@ import { SubscriptionManager } from './x-subscriptions.js';
 
 export const log = (message) => console.log(`${new Date().toLocaleTimeString()}  ${message}`);
 
-function watchPlainKeyboard({ onToggle, onQuit }) {
+// One Ctrl+C can arrive twice: the terminal sends it to npm and to its script,
+// and npm passes its copy on. A key can also repeat. Neither is a second request.
+const SAME_REQUEST_MS = 1000;
+
+function watchPlainKeyboard({ onToggle, onQuit, onInterrupt }) {
   const { stdin } = process;
   if (!stdin.isTTY) return () => {};
 
-  const onData = (key) => {
-    if (key === ' ') onToggle();
-    else if (key === 'q' || key === '\u0003') onQuit();
+  // Keys pressed close together can arrive in one read. Ctrl+C counts wherever
+  // it turns up. Space and q only count in a read made of nothing but keys,
+  // so that a paste cannot press them.
+  const onData = (chunk) => {
+    const keys = [...chunk];
+    const typed = keys.every((key) => key === ' ' || key === 'q' || key === '\u0003');
+    for (const key of keys) {
+      if (key === '\u0003') onInterrupt();
+      else if (typed && key === ' ') onToggle();
+      else if (typed && key === 'q') onQuit();
+    }
   };
   stdin.setRawMode(true);
   stdin.setEncoding('utf8');
@@ -28,12 +40,19 @@ function watchPlainKeyboard({ onToggle, onQuit }) {
 
   return () => {
     stdin.off('data', onData);
-    stdin.setRawMode(false);
+    try {
+      stdin.setRawMode(false);
+    } catch {
+      // The terminal is gone. What comes after a quit still has to happen.
+    }
     stdin.pause();
   };
 }
 
 export async function runService(config, { noDevice = false, plain = false } = {}) {
+  // Checked before anything is subscribed to, since the stream cannot open without it.
+  if (!config.bearerToken) throw new Error('Set X_BEARER_TOKEN in .env first.');
+
   const interactive = !plain && process.stdin.isTTY && process.stdout.isTTY;
   const auth = new XAuth(config);
   const account = await auth.requireSession();
@@ -85,25 +104,59 @@ export async function runService(config, { noDevice = false, plain = false } = {
 
   const subscriptions = new SubscriptionManager(api, account.user_id, { stateDir: config.stateDir, log: say });
   const shutdown = new AbortController();
+  let quitAt = 0;
+  let unsubscribed = false;
 
-  const quit = (reason) => {
-    if (shutdown.signal.aborted) process.exit(1);
-    if (reason) say(reason);
+  // Starts a clean shutdown. Asking again changes nothing: only `interrupt`
+  // can cut one short.
+  const quit = (reason = 'Shutting down.') => {
+    if (shutdown.signal.aborted) return;
+    quitAt = Date.now();
+    say(reason);
     shutdown.abort();
     // Stop the motor right away, before any slower network cleanup.
     player.close();
   };
-  const onSignal = () => quit('Shutting down.');
+  // Ctrl+C, or a signal that means the same. The first is an ordinary quit. A
+  // later one means now, without waiting for X, so say what that leaves behind.
+  const interrupt = () => {
+    if (!shutdown.signal.aborted) {
+      quit();
+      return;
+    }
+    if (Date.now() - quitAt < SAME_REQUEST_MS) return;
+    restoreTerminal();
+    if (!unsubscribed) {
+      log('Quit before the X subscriptions were removed. X bills for them until they expire. Run `npm run cleanup`.');
+    }
+    process.exit(1);
+  };
+  // A crash while shutting down is reported, but the shutdown still finishes.
+  // The dashboard takes its notices with it when it closes, so a reason it was
+  // showing is kept, to print once the terminal is back.
+  const crashes = [];
   const onCrash = (error) => {
     process.exitCode = 1;
-    quit(`Unexpected error: ${error?.message ?? error}`);
+    const reason = `Unexpected error: ${error?.message ?? error}`;
+    if (tui?.active) crashes.push(reason);
+    if (shutdown.signal.aborted) say(reason);
+    else quit(reason);
   };
-  const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
-  signals.forEach((name) => process.on(name, onSignal));
-  process.on('uncaughtException', onCrash);
-  process.on('unhandledRejection', onCrash);
+  // A closed terminal sends SIGHUP. Nobody is waiting, so it never cuts cleanup short.
+  const handlers = {
+    SIGINT: interrupt,
+    SIGTERM: interrupt,
+    SIGHUP: () => quit(),
+    uncaughtException: onCrash,
+    unhandledRejection: onCrash,
+  };
+  Object.entries(handlers).forEach(([name, handler]) => process.on(name, handler));
+  // A closed terminal or pipe fails every write to it. Nobody is left to read
+  // them, so that is a reason to leave cleanly and never a crash. These stay
+  // attached, because the last lines are written after the rest is undone.
+  for (const stream of [process.stdout, process.stderr]) stream.on('error', () => quit());
 
-  const tui = interactive ? new Tui(session, { onQuit: () => quit('Shutting down.') }) : null;
+  const tui = interactive ? new Tui(session, { onQuit: () => quit(), onInterrupt: interrupt }) : null;
   const stopPlainKeyboard = interactive
     ? () => {}
     : watchPlainKeyboard({
@@ -111,8 +164,14 @@ export async function runService(config, { noDevice = false, plain = false } = {
         session.togglePause();
         log(session.paused ? 'Stopped and paused. Press space to resume.' : 'Resumed.');
       },
-      onQuit: () => quit('Shutting down.'),
+      onQuit: () => quit(),
+      onInterrupt: interrupt,
     });
+  const restoreTerminal = () => {
+    tui?.stop();
+    stopPlainKeyboard();
+    for (const reason of crashes.splice(0)) log(reason);
+  };
 
   const stream = new ActivityStream({
     api,
@@ -129,20 +188,20 @@ export async function runService(config, { noDevice = false, plain = false } = {
     await subscriptions.start();
     await stream.run(shutdown.signal);
   } finally {
-    tui?.stop();
+    restoreTerminal();
     session.notify = log;
-    stopPlainKeyboard();
     await player.close();
     await output.close();
     clearTimeout(saveTimer);
     if (unsaved) persist();
     await saving;
+    // This takes a few requests to X, and silence here looks like a hang.
+    log('Removing X subscriptions…');
     const { failed } = await subscriptions.stop();
+    unsubscribed = true;
     if (failed > 0) log(`${failed} X subscription(s) could not be removed. Run \`npm run cleanup\`.`);
     else log('Removed X subscriptions.');
     log(`Estimated API cost this session: ${formatUsd(session.cost.snapshot().totalMicros)}`);
-    signals.forEach((name) => process.off(name, onSignal));
-    process.off('uncaughtException', onCrash);
-    process.off('unhandledRejection', onCrash);
+    Object.entries(handlers).forEach(([name, handler]) => process.off(name, handler));
   }
 }

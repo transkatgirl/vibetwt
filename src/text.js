@@ -11,13 +11,43 @@ export function sanitizeText(value) {
     .replace(/\r\n?/g, '\n')
     .replace(/\t/g, ' ')
     .replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f؜‎‏‪-‮⁦-⁩]/g, '')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
     .trim();
 }
 
+// X escapes these three in post text. They are undone once, where that text
+// comes in, because a second pass would turn a post's literal "&lt;" into "<".
+export const decodeEntities = (text) => text
+  .replace(/&lt;/g, '<')
+  .replace(/&gt;/g, '>')
+  .replace(/&amp;/g, '&');
+
 export const singleLine = (text) => sanitizeText(text).replace(/\s+/g, ' ');
+
+// A word is a run of letters, digits and underscores, so `type:reply` is two
+// and `@some_name` is one. Marks and joiners carry a word on, which keeps
+// accents and joined scripts in one piece, but cannot begin one: the selector
+// and joiners inside an emoji are not words, and stopping at them would leave
+// the cursor in the middle of it.
+const WORD = /[\p{L}\p{N}_][\p{L}\p{N}\p{M}_\u200c\u200d]*/gu;
+
+// Where a word jump lands from `index`: on the start of the word before it...
+export function wordStartBefore(text, index) {
+  let start = 0;
+  for (const word of text.matchAll(WORD)) {
+    if (word.index >= index) break;
+    start = word.index;
+  }
+  return start;
+}
+
+// ...or on the end of the word after it.
+export function wordEndAfter(text, index) {
+  for (const word of text.matchAll(WORD)) {
+    const end = word.index + word[0].length;
+    if (end > index) return end;
+  }
+  return text.length;
+}
 
 const WIDE_RANGES = [
   [0x1100, 0x115f], [0x2e80, 0x303e], [0x3041, 0x33ff], [0x3400, 0x4dbf], [0x4e00, 0x9fff],
