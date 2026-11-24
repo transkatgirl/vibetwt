@@ -106,6 +106,29 @@ test('cleanup removes only this app\'s subscriptions', async (t) => {
   assert.deepEqual(deleted, ['current']);
 });
 
+// With nothing listed, all there is to remove is what was written down. None
+// of that being left is not the same as nothing being open.
+test('a cleanup that could not ask X what is open says so', async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'vibetwt-test-'));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  await writeFile(join(stateDir, 'subscriptions.json'), '["left-open"]');
+  const deleted = [];
+  const logs = [];
+  const api = {
+    async json(method, path) {
+      if (method === 'GET') throw new XApiError(503, 'Service Unavailable');
+      deleted.push(path.split('/').at(-1));
+      return {};
+    },
+  };
+  const manager = new SubscriptionManager(api, ME, { stateDir, log: (line) => logs.push(line) });
+
+  assert.deepEqual(await manager.cleanup(), { deleted: 1, failed: 0, listed: false });
+  assert.deepEqual(deleted, ['left-open'], 'what it knew of is removed all the same');
+  assert.deepEqual(logs, ['Could not list subscriptions: X API returned HTTP 503: Service Unavailable']);
+  assert.deepEqual(await manager.cleanup(), { deleted: 0, failed: 0, listed: false }, 'and finding none is not taken for there being none');
+});
+
 // X's docs say that creating a subscription which already exists refreshes it
 // and keeps it. With `refreshes: false`, this X makes a second one instead.
 function subscriptionApi({ refreshes }) {
@@ -141,7 +164,7 @@ test('a saved list that cannot be read does not stop the cleanup', async (t) => 
     assert.equal(api.live.size, 3);
 
     await writeFile(file, contents);
-    assert.deepEqual(await manager.stop(), { deleted: 3, failed: 0 }, contents);
+    assert.deepEqual(await manager.stop(), { deleted: 3, failed: 0, listed: true }, contents);
     assert.equal(api.live.size, 0, contents);
     assert.equal(logs.length, 1, logs.join('\n'));
     assert.match(logs[0], /^Could not read the saved subscriptions: /);
@@ -152,7 +175,7 @@ test('a saved list that cannot be read does not stop the cleanup', async (t) => 
     const next = new SubscriptionManager(api, ME, { stateDir });
     await next.start();
     assert.equal(api.live.size, 3, contents);
-    assert.deepEqual(await next.stop(), { deleted: 3, failed: 0 }, contents);
+    assert.deepEqual(await next.stop(), { deleted: 3, failed: 0, listed: true }, contents);
   }
 });
 
@@ -215,7 +238,7 @@ test('stopping in the middle of a renewal still leaves nothing subscribed', asyn
     const stopping = manager.stop();
     await turns(50);
     held.resolve();
-    assert.deepEqual(await stopping, { deleted: 3 + (refreshes ? 0 : 1), failed: 0 });
+    assert.deepEqual(await stopping, { deleted: 3 + (refreshes ? 0 : 1), failed: 0, listed: true });
     await turns(50);
     t.mock.timers.tick(24 * 60 * 60_000);
     await turns(50);
@@ -278,7 +301,7 @@ test('a renewal X will go on refusing is reported once and not tried again, unli
     }
 
     api.json = answer;
-    assert.deepEqual(await manager.stop(), { deleted: 3, failed: 0 }, `${label}: stopping still removes them`);
+    assert.deepEqual(await manager.stop(), { deleted: 3, failed: 0, listed: true }, `${label}: stopping still removes them`);
   }
 });
 
@@ -346,6 +369,37 @@ test('a reconnect that drops early asks again for what it was meant to recover',
 
   await new ActivityStream({ api, onEvent() {} }).run(stop.signal);
   assert.deepEqual(queries, [{}, { backfill_minutes: 3 }, { backfill_minutes: 3 }]);
+});
+
+// Counted on the clock, the time since the last word from X comes out as less
+// than none. X takes 0 to 5 minutes and turns down anything else, which would
+// end the run.
+test('a clock set back while connected still asks for a backfill X will give', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const keepAlive = new TextEncoder().encode('\r\n');
+  const stop = new AbortController();
+  const queries = [];
+  const connections = [
+    async function* lastsThenDrops() {
+      yield keepAlive;
+      t.mock.timers.tick(40_000);
+      yield keepAlive;
+      t.mock.timers.setTime(Date.now() - 10 * 60_000);
+      throw new Error('dropped');
+    },
+    async function* ends() {
+      stop.abort();
+    },
+  ];
+  const api = {
+    async openStream(query) {
+      queries.push(query);
+      return { body: connections[queries.length - 1]() };
+    },
+  };
+
+  await new ActivityStream({ api, onEvent() {} }).run(stop.signal);
+  assert.deepEqual(queries, [{}, { backfill_minutes: 5 }], 'how long it was is not known, so all there is');
 });
 
 test('a login that has run out ends the stream, since asking again cannot bring it back', async () => {
@@ -568,6 +622,30 @@ test('muting stops immediately, even while a slow command is pending', async () 
   await sleep(5);
   output.releaseAll();
   await mixer.settled();
+});
+
+// The stop lands after the command it went past, so the device is stopped
+// when that command is answered: at neither its level nor the one before it.
+test('a level wanted again after a stop went past a pending command is sent again', async () => {
+  for (const [resumed, which] of [[0.9, 'the level still pending'], [0.5, 'the level before it']]) {
+    const output = new SlowOutput();
+    const mixer = new Mixer(output);
+    const channel = mixer.channel();
+    channel.set(0.5);
+    output.releaseAll();
+    await mixer.settled();
+
+    channel.set(0.9);
+    mixer.setMuted(true);
+    channel.set(resumed);
+    mixer.setMuted(false);
+    assert.deepEqual(output.sent, [0.5, 0.9, 0], which);
+    output.releaseAll();
+    await sleep(5);
+    assert.deepEqual(output.sent, [0.5, 0.9, 0, resumed], `${which} is not taken for what the device is playing`);
+    output.releaseAll();
+    await mixer.settled();
+  }
 });
 
 test('resync restores the current level after a reconnect', async () => {

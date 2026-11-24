@@ -96,8 +96,16 @@ export class Mixer {
   // Commands stay in order on the socket, so nothing older can land after it.
   // This comes before the level is updated, because a device that has caught
   // up has no queue: the update sends its stop, and one stop is enough.
+  //
+  // The command it went past still gets its answer, and by then that is not
+  // what the device is doing. Nor is the level from before it. So what was
+  // sent counts as unknown, as it does after a reconnect, and whatever is
+  // wanted once that answer comes is sent again.
   #stopPastQueue() {
-    if (this.#isDraining) this.#output.stop().catch((error) => this.#report(error));
+    if (!this.#isDraining) return;
+    this.#output.stop().catch((error) => this.#report(error));
+    this.#generation++;
+    this.#sent = undefined;
   }
 
   // The flag is cleared in the same tick the loop exits, so a level asked for

@@ -62,14 +62,18 @@ export class SubscriptionManager {
   }
 
   // Deletes only subscriptions this app created, never others on the X app.
+  // `listed` is whether X said which ones are open. Without that, only the
+  // ones known of here were removed, and nothing says there were no more.
   async cleanup() {
     const ids = new Set([...this.#active.values(), ...(await this.#savedIds())]);
+    let listed = true;
     try {
       const list = await this.#api.json('GET', PATH);
       for (const subscription of list?.data ?? []) {
         if (subscription.tag === TAG) ids.add(subscription.subscription_id);
       }
     } catch (error) {
+      listed = false;
       this.#log(`Could not list subscriptions: ${error.message}`);
     }
 
@@ -85,7 +89,7 @@ export class SubscriptionManager {
 
     this.#active.clear();
     await this.#persist(failed);
-    return { deleted: ids.size - failed.length, failed: failed.length };
+    return { deleted: ids.size - failed.length, failed: failed.length, listed };
   }
 
   async #createAll() {

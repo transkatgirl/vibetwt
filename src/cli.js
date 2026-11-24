@@ -127,9 +127,11 @@ async function main() {
           stateDir: config.stateDir,
           log,
         });
-        const { deleted, failed } = await manager.cleanup();
+        const { deleted, failed, listed } = await manager.cleanup();
         console.log(`Removed ${deleted} subscription(s).${failed ? ` ${failed} failed.` : ''}`);
-        if (failed) process.exitCode = 1;
+        // None found is only good news if X was there to be asked.
+        if (!listed) console.log('X did not say which subscriptions are open, so there may be more. Run `npm run cleanup` again.');
+        if (failed || !listed) process.exitCode = 1;
       } finally {
         unlock();
       }

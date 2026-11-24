@@ -491,6 +491,31 @@ test('a second copy is refused while one is running, and its subscriptions are l
   }
 });
 
+// With nothing written down and nothing listed, there is nothing to remove.
+// That is no sign of nothing being open, when X never said.
+test('a cleanup that X would not answer does not pass for one that found nothing', async () => {
+  const unwell = createHttpServer((req, res) => {
+    res.writeHead(503, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ title: 'Service Unavailable' }));
+  });
+  unwell.listen(0, '127.0.0.1');
+  await once(unwell, 'listening');
+  const x = { url: `http://127.0.0.1:${unwell.address().port}` };
+  const cleanup = await startApp(x, { url: 'ws://127.0.0.1:1' }, {}, { command: 'cleanup', ready: false });
+
+  try {
+    const code = cleanup.child.exitCode ?? (await once(cleanup.child, 'exit'))[0];
+    await waitFor(() => cleanup.output.includes('there may be more'), { label: `saying so:\n${cleanup.output}` });
+    assert.match(cleanup.output, /Could not list subscriptions: X API returned HTTP 503/);
+    assert.match(cleanup.output, /Removed 0 subscription\(s\)\.\nX did not say which subscriptions are open/);
+    assert.equal(code, 1, cleanup.output);
+  } finally {
+    await stopApp(cleanup);
+    unwell.closeAllConnections();
+    unwell.close();
+  }
+});
+
 // After a crash or a power cut the lock is still there, naming a process that is not.
 test('a lock left by a copy that is gone keeps nobody out', async () => {
   const gone = spawn(process.execPath, ['-e', '']);

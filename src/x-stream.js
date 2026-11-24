@@ -19,6 +19,14 @@ function duration(ms) {
   return `${Math.floor(seconds / 60)} min${left ? ` ${left}s` : ''}`;
 }
 
+// How many minutes to ask X to send again, after `ms` without hearing from it.
+// A clock that was set back makes that less than no time, which says nothing
+// about how long it was, so all that X will give is asked for. Whatever comes
+// twice is dropped as a repeat.
+function minutesToRecover(ms) {
+  return ms < 0 ? MAX_BACKFILL_MINUTES : Math.min(MAX_BACKFILL_MINUTES, Math.ceil(ms / 60_000));
+}
+
 // X does not document this stream's framing, so split on complete JSON objects.
 // This handles newline-delimited, concatenated, and blank keep-alive data.
 export class JsonFrameSplitter {
@@ -93,9 +101,7 @@ export class ActivityStream {
     let backfillAllowed = true;
 
     while (!signal.aborted) {
-      const backfill = caughtUpAt && backfillAllowed
-        ? Math.min(MAX_BACKFILL_MINUTES, Math.ceil((Date.now() - caughtUpAt) / 60_000))
-        : 0;
+      const backfill = caughtUpAt && backfillAllowed ? minutesToRecover(Date.now() - caughtUpAt) : 0;
       // When this connection opened, if it did.
       let openedAt = null;
       let problem = null;

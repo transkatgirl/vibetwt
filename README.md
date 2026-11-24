@@ -155,7 +155,7 @@ and who does not. Press `/` and combine any of these:
 | Filter | Matches |
 |---|---|
 | `type:like,reply` | Any of those interaction types |
-| `tweet:<ID or URL>` | That tweet, including replies anywhere in its thread |
+| `tweet:<ID or URL>` | That tweet and replies to it, plus replies anywhere in a thread it started |
 | `from:@name` or `from:<ID>` | That user |
 | `word` or `"exact phrase"` | Text in the tweet, reply, or username |
 
